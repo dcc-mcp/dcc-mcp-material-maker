@@ -1,4 +1,4 @@
-"""Standalone GIMP MCP server lifecycle."""
+"""Standalone MATERIAL_MAKER MCP server lifecycle."""
 
 from __future__ import annotations
 
@@ -15,29 +15,29 @@ from dcc_mcp_core.server_base import DccServerBase
 from .__version__ import __version__
 
 DEFAULT_PORT = 8767
-_server: Optional["GimpMcpServer"] = None
+_server: Optional["MaterialMakerMcpServer"] = None
 
 
-class GimpMcpServer(DccServerBase):
-    """GIMP 3 adapter using its Python plug-in bridge."""
+class MaterialMakerMcpServer(DccServerBase):
+    """MaterialMaker adapter using its Python plug-in bridge."""
 
     def __init__(self, port: int = DEFAULT_PORT) -> None:
         os.environ.setdefault("DCC_MCP_PYTHON_EXECUTABLE", sys.executable)
         options = DccServerOptions.from_env(
-            "gimp",
+            "material_maker",
             Path(__file__).resolve().parent / "skills",
             port=port,
-            server_name="dcc-mcp-gimp",
+            server_name="dcc-mcp-material-maker",
             server_version=__version__,
         )
         super().__init__(options=options)
 
 
-def start_server(port: Optional[int] = None) -> GimpMcpServer:
+def start_server(port: Optional[int] = None) -> MaterialMakerMcpServer:
     global _server
     if _server is None or not _server.is_running:
-        selected_port = port or int(os.environ.get("DCC_MCP_GIMP_PORT", DEFAULT_PORT))
-        _server = GimpMcpServer(selected_port)
+        selected_port = port or int(os.environ.get("DCC_MCP_MATERIAL_MAKER_PORT", DEFAULT_PORT))
+        _server = MaterialMakerMcpServer(selected_port)
         _server.register_builtin_actions()
         _server.start()
     return _server

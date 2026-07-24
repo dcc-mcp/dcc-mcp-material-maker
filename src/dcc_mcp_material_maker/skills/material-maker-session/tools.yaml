@@ -1,6 +1,6 @@
 tools:
   - name: get_status
-    description: Check the GIMP 3 plug-in bridge and return GIMP version and bridge metadata.
+    description: Check the Material Maker plug-in bridge and return MATERIAL MAKER version and bridge metadata.
     input_schema: {type: object, properties: {}, additionalProperties: false}
     output_schema: {type: object}
     read_only: true
@@ -11,7 +11,7 @@ tools:
     timeout_hint_secs: 30
     source_file: scripts/get_status.py
   - name: list_images
-    description: List open GIMP images with dimensions and names. Read-only.
+    description: List open MATERIAL MAKER images with dimensions and names. Read-only.
     input_schema: {type: object, properties: {}, additionalProperties: false}
     output_schema: {type: object}
     read_only: true
@@ -22,7 +22,7 @@ tools:
     timeout_hint_secs: 30
     source_file: scripts/list_images.py
   - name: get_active_image
-    description: Return metadata for the active GIMP image. Read-only.
+    description: Return metadata for the active MATERIAL MAKER image. Read-only.
     input_schema: {type: object, properties: {}, additionalProperties: false}
     output_schema: {type: object}
     read_only: true

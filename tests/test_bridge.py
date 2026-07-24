@@ -2,7 +2,7 @@ import json
 import socket
 import threading
 
-from dcc_mcp_gimp.bridge import GimpBridge
+from dcc_mcp_material_maker.bridge import MaterialMakerBridge
 
 
 def test_bridge_sends_json_lines_request():
@@ -18,7 +18,7 @@ def test_bridge_sends_json_lines_request():
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)
     threading.Thread(target=serve, args=(listener,), daemon=True).start()
-    bridge = GimpBridge(port=listener.getsockname()[1])
-    assert bridge.call("gimp.ping") == {"ready": True}
-    assert received["request"]["method"] == "gimp.ping"
+    bridge = MaterialMakerBridge(port=listener.getsockname()[1])
+    assert bridge.call("material_maker.ping") == {"ready": True}
+    assert received["request"]["method"] == "material_maker.ping"
     listener.close()

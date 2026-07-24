@@ -1,57 +1,17 @@
 name: CI
-
 on:
   push:
-    branches: [main]
   pull_request:
-
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: python -m pip install -e '.[dev]'
+        with: {python-version: "3.12"}
+      - run: python -m pip install -e ".[dev]"
       - run: python -m pytest
       - run: python -m ruff check src tests tools
       - run: python tools/lint_skills.py
+      - run: python -m py_compile bridge/material_maker-plugin/dcc_mcp_material_maker.py
       - run: python -m build && python -m twine check dist/*
-
-  gimp3-smoke:
-    needs: test
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install GIMP runtime dependencies
-        run: sudo apt-get update && sudo apt-get install -y curl ca-certificates
-      - name: Download official GIMP 3 AppImage
-        shell: bash
-        run: |
-          set -euo pipefail
-          version=3.0.8-1
-          base=https://download.gimp.org/gimp/v3.0/linux
-          asset="GIMP-${version}-x86_64.AppImage"
-          curl -fsSL "$base/$asset" -o "$asset"
-          curl -fsSL "$base/SHA256SUMS" | grep "$asset" > gimp.sha256
-          sha256sum -c gimp.sha256
-          mv "$asset" gimp.AppImage
-          chmod +x gimp.AppImage
-      - name: Install the GIMP plug-in
-        run: |
-          mkdir -p "$HOME/.config/GIMP/3.0/plug-ins/dcc_mcp_gimp"
-          cp bridge/gimp-plugin/dcc_mcp_gimp.py "$HOME/.config/GIMP/3.0/plug-ins/dcc_mcp_gimp/"
-          chmod +x "$HOME/.config/GIMP/3.0/plug-ins/dcc_mcp_gimp/dcc_mcp_gimp.py"
-      - name: Verify GIMP 3 runtime and plug-in
-        shell: bash
-        run: |
-          set -euo pipefail
-          ./gimp.AppImage --appimage-extract-and-run --version
-          python -m py_compile bridge/gimp-plugin/dcc_mcp_gimp.py
-          test -x "$HOME/.config/GIMP/3.0/plug-ins/dcc_mcp_gimp/dcc_mcp_gimp.py"

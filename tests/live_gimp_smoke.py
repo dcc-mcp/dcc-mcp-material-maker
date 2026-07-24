@@ -1,4 +1,4 @@
-"""Exercise the real GIMP plug-in bridge and MCP tools."""
+"""Exercise the real MATERIAL_MAKER plug-in bridge and MCP tools."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ import json
 import time
 import urllib.request
 
-from dcc_mcp_gimp.bridge import GimpBridge
-from dcc_mcp_gimp.server import GimpMcpServer
+from dcc_mcp_material_maker.bridge import MaterialMakerBridge
+from dcc_mcp_material_maker.server import MaterialMakerMcpServer
 
 
 def post(url: str, method: str, params=None):
@@ -35,23 +35,23 @@ def call(url: str, name: str, arguments=None):
 
 
 def main() -> None:
-    bridge = GimpBridge.from_env()
+    bridge = MaterialMakerBridge.from_env()
     deadline = time.monotonic() + 45
     while time.monotonic() < deadline:
         try:
-            status = bridge.call("gimp.get_status")
+            status = bridge.call("material_maker.get_status")
             break
         except Exception:
             time.sleep(0.5)
     else:
-        raise RuntimeError("GIMP plug-in bridge did not become ready")
+        raise RuntimeError("MATERIAL_MAKER plug-in bridge did not become ready")
 
-    server = GimpMcpServer(port=0)
+    server = MaterialMakerMcpServer(port=0)
     try:
         server.register_builtin_actions()
         server.start(install_atexit_hook=False)
         url = server.mcp_url
-        call(url, "load_skill", {"skill_name": "gimp-session"})
+        call(url, "load_skill", {"skill_name": "material_maker-session"})
         listed = post(url, "tools/list", {})["result"]["tools"]
         names = {item["name"] for item in listed}
         assert any(name.endswith("__get_status") for name in names)
