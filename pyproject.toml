@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dcc-mcp-material-maker"
-version = "0.1.0"
+version = "0.2.0"
 description = "Material Maker adapter for the DCC Model Context Protocol"
 readme = "README.md"
 requires-python = ">=3.9"
