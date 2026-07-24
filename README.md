@@ -4,7 +4,7 @@
 
 Material Maker adapter for the DCC Model Context Protocol ecosystem.
 
-![Material Maker and game-material workflow](docs/images/dcc-mcp-material-maker-showcase.gif)
+![Material Maker and game-material workflow](docs/images/dcc-mcp-material-maker-showcase.webp)
 
 The adapter uses a process-isolated loopback JSON-lines bridge contract and does not
 expose arbitrary source evaluation.
