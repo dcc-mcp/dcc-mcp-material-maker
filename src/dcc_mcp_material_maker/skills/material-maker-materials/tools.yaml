@@ -1,0 +1,84 @@
+tools:
+  - name: get_status
+    description: Verify the Material Maker executable, documented export targets, workspace roots, and safety limits.
+    source_file: scripts/get_status.py
+    input_schema:
+      type: object
+      properties:
+        probe: {type: boolean, default: true, description: "Run a no-input native CLI readiness probe."}
+        timeout_secs: {type: number, minimum: 1, maximum: 1800, default: 60}
+      additionalProperties: false
+    output_schema: {type: object}
+    execution: async
+    job_strategy: monolithic
+    affinity: any
+    enforce_thread_affinity: true
+    timeout_hint_secs: 1800
+    annotations: {read_only_hint: true, destructive_hint: false, idempotent_hint: true, open_world_hint: false, deferred_hint: true}
+
+  - name: inspect_project
+    description: Read bounded PTEX JSON and summarize graph, node-type, connection, material-node, size, and hash metadata.
+    source_file: scripts/inspect_project.py
+    input_schema:
+      type: object
+      required: [path]
+      properties:
+        path: {type: string, minLength: 1, description: "PTEX project under the configured roots."}
+      additionalProperties: false
+    output_schema: {type: object}
+    execution: async
+    job_strategy: monolithic
+    affinity: any
+    enforce_thread_affinity: true
+    timeout_hint_secs: 120
+    annotations: {read_only_hint: true, destructive_hint: false, idempotent_hint: true, open_world_hint: false, deferred_hint: true}
+    call_examples:
+      - arguments: {path: "materials/bricks.ptex"}
+        note: Inspect a procedural material before export.
+    next-tools:
+      on-failure: [get_status]
+
+  - name: validate_project
+    description: Validate bounded PTEX graph structure, unique node names, connection endpoints, ports, and configured limits.
+    source_file: scripts/validate_project.py
+    input_schema:
+      type: object
+      required: [path]
+      properties:
+        path: {type: string, minLength: 1}
+      additionalProperties: false
+    output_schema: {type: object}
+    execution: async
+    job_strategy: monolithic
+    affinity: any
+    enforce_thread_affinity: true
+    timeout_hint_secs: 120
+    annotations: {read_only_hint: true, destructive_hint: false, idempotent_hint: true, open_world_hint: false, deferred_hint: true}
+    next-tools:
+      on-failure: [inspect_project]
+
+  - name: export_material
+    description: Export one validated PTEX project through Material Maker into a new bounded directory for a documented engine family.
+    source_file: scripts/export_material.py
+    input_schema:
+      type: object
+      required: [project_path, output_directory]
+      properties:
+        project_path: {type: string, minLength: 1}
+        output_directory: {type: string, minLength: 1, description: "A new directory under the configured roots."}
+        target: {type: string, enum: [Blender, Godot, Unity, Unreal], default: Godot}
+        output_file: {type: string, minLength: 1, maxLength: 128, default: "%f"}
+        timeout_secs: {type: number, minimum: 1, maximum: 1800, default: 900}
+      additionalProperties: false
+    output_schema: {type: object}
+    execution: async
+    job_strategy: monolithic
+    affinity: any
+    enforce_thread_affinity: true
+    timeout_hint_secs: 1800
+    annotations: {read_only_hint: false, destructive_hint: true, idempotent_hint: false, open_world_hint: false, deferred_hint: true}
+    call_examples:
+      - arguments: {project_path: "materials/bricks.ptex", output_directory: "exports/bricks-godot", target: Godot}
+        note: Export a validated material into a new Godot handoff directory.
+    next-tools:
+      on-failure: [validate_project, get_status]
