@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/dcc-mcp/dcc-mcp-material-maker/compare/v0.2.0...v0.3.0) (2026-08-12)
+
+
+### Features
+
+* ship production-ready Material Maker workflows ([#2](https://github.com/dcc-mcp/dcc-mcp-material-maker/issues/2)) ([7dce05f](https://github.com/dcc-mcp/dcc-mcp-material-maker/commit/7dce05fff851c705f6a5f74a44b0ee68d2fe2aa9))
+
 ## 0.3.0
 
 - Replace the legacy session placeholder with a standalone Material Maker adapter.
