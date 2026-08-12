@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0
+
+- Replace the legacy session placeholder with a standalone Material Maker adapter.
+- Add bounded PTEX inspection and structural validation.
+- Add staged native export for documented Blender, Godot, Unity, and Unreal targets.
+- Add four typed Skill tools, Python 3.9/3.12 CI, packaging checks, and architecture docs.
+
 ## [0.2.0](https://github.com/dcc-mcp/dcc-mcp-material-maker/compare/v0.1.0...v0.2.0) (2026-07-24)
 
 

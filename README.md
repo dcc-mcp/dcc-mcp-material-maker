@@ -1,49 +1,81 @@
 # dcc-mcp-material-maker
 
-![DCC-MCP Material Maker](docs/images/dcc-mcp-material-maker.svg)
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/dcc-mcp-material-maker-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/images/dcc-mcp-material-maker.svg">
+    <img src="docs/images/dcc-mcp-material-maker.svg" alt="DCC-MCP · MATERIAL MAKER" width="600">
+  </picture>
+</p>
 
-Material Maker adapter for the DCC Model Context Protocol ecosystem.
+Typed, workspace-bounded Material Maker automation for DCC-MCP.
 
-![Material Maker and game-material workflow](docs/images/dcc-mcp-material-maker-showcase.webp)
+![Material Maker and game-material workflow](docs/images/material-maker-showcase.webp)
 
-The adapter uses a process-isolated loopback JSON-lines bridge contract and does not
-expose arbitrary source evaluation.
+_Illustrative workflow generated with OpenAI ImageGen from the retained source in `docs/images/sources`; it is not a Material Maker screenshot or host-validation artifact._
 
-## Install
+The adapter inspects and validates Material Maker `.ptex` graphs without launching
+the editor, then uses Material Maker's documented command-line exporter for
+Blender, Godot, Unity, or Unreal handoff. It is a standalone service: there is no
+in-process plug-in, loopback bridge, arbitrary GDScript, shader, or shell input.
+
+## Capabilities
+
+| Typed tool | Contract |
+| --- | --- |
+| `get_status` | Discover the native executable and optionally run a bounded headless readiness probe. |
+| `inspect_project` | Report file hash, graph/node/connection counts, material outputs, and node types. |
+| `validate_project` | Check graph structure, unique node names, endpoints, ports, and configured limits. |
+| `export_material` | Export one valid `.ptex` project into a new staging-backed output directory. |
+
+Interactive graph authoring is intentionally outside this adapter's typed
+contract. Use Material Maker itself when visible node editing is required.
+
+## Requirements
+
+- Python 3.9 or newer
+- `dcc-mcp-core` 0.19.38 or newer
+- Material Maker 1.7 for native export
+
+Install the adapter and point it at the official Material Maker executable:
 
 ```bash
 pip install dcc-mcp-material-maker
-dcc-mcp-material-maker-install
-```
-
-Configure the Material Maker bridge endpoint, then start:
-
-```bash
+export DCC_MCP_MATERIAL_MAKER_EXECUTABLE=/opt/material-maker/material_maker
+export DCC_MCP_MATERIAL_MAKER_ALLOWED_ROOTS=/workspace/materials
+dcc-mcp-material-maker-doctor
 dcc-mcp-material-maker
 ```
 
-The MCP endpoint defaults to `http://127.0.0.1:8767/mcp`; the plug-in bridge uses
-`127.0.0.1:3848`. Override the latter with `DCC_MCP_MATERIAL MAKER_BRIDGE_PORT` before
-starting both processes.
+On Windows, use semicolons between multiple allowed roots; on POSIX systems,
+use colons. The adapter also searches common installation locations when the
+executable variable is omitted.
 
-## Current tools
+## Safety model
 
-- Check MATERIAL MAKER bridge status and version.
-- List open images with dimensions.
-- Inspect the active image.
+- resolves projects and destinations under explicit allowed roots;
+- accepts UTF-8 JSON `.ptex` projects only;
+- bounds project size, graph traversal, node/connection counts, export files,
+  export bytes, runtime, and captured output;
+- invokes a fixed executable argument vector with `shell=False` semantics;
+- supports Core cancellation and terminates timed-out child processes;
+- exports into a private staging directory, rejects links and empty output,
+  hashes every file, and atomically exposes only a complete new directory;
+- never overwrites an existing export directory.
 
-The first release targets safe session discovery. Image mutation and export will
-be added only through typed MATERIAL MAKER procedures, not arbitrary source evaluation.
+See [Architecture](docs/architecture.md) for trust boundaries and configuration.
 
 ## Development
 
 ```bash
 python -m pip install -e ".[dev]"
-python -m pytest
+python -m pytest -q
 python -m ruff check src tests tools
+python -m ruff format --check src tests tools
 python tools/lint_skills.py
 python -m build
 python -m twine check dist/*
 ```
 
-Material Maker plug-in API reference: https://developer.material_maker.org/api/3.0/
+The native exporter follows the official Material Maker command-line interface:
+<https://rodzilla.itch.io/material-maker>.
