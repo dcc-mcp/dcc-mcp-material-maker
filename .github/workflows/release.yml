@@ -31,7 +31,7 @@ jobs:
       url: https://pypi.org/p/dcc-mcp-material-maker
     permissions:
       id-token: write
-      contents: read
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -41,4 +41,8 @@ jobs:
           python-version: "3.12"
       - run: python -m pip install build twine
       - run: python -m build && python -m twine check dist/*
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ needs.release-please.outputs.tag_name }}
+          files: dist/*
       - uses: pypa/gh-action-pypi-publish@release/v1
