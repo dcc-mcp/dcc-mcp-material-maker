@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/dcc-mcp/dcc-mcp-material-maker/compare/v0.3.0...v0.3.1) (2026-08-13)
+
+
+### Bug Fixes
+
+* **release:** retain distributions on GitHub releases ([#4](https://github.com/dcc-mcp/dcc-mcp-material-maker/issues/4)) ([2cead3a](https://github.com/dcc-mcp/dcc-mcp-material-maker/commit/2cead3a077b0ebfb67b3c4439a0f58a0be772fcf))
+
 ## [0.3.0](https://github.com/dcc-mcp/dcc-mcp-material-maker/compare/v0.2.0...v0.3.0) (2026-08-12)
 
 
