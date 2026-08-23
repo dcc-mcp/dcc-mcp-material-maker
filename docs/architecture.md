@@ -58,7 +58,7 @@ Material Maker's general argument surface.
 | `DCC_MCP_MATERIAL_MAKER_MAX_EXPORT_FILES` | 512 | Maximum exported regular files. |
 | `DCC_MCP_MATERIAL_MAKER_MAX_EXPORT_BYTES` | 2 GiB | Maximum aggregate export size. |
 | `DCC_MCP_MATERIAL_MAKER_MAX_TIMEOUT_SECS` | 1,800 | Maximum native process deadline. |
-| `DCC_MCP_MATERIAL_MAKER_VERSION` | `unknown` | Optional deployment metadata. |
+| `DCC_MCP_MATERIAL_MAKER_VERSION` | unset | Operator-supplied product release required for verify-to-usable; the native CLI has no documented product-version verb. |
 
 ## Failure semantics
 
@@ -67,6 +67,11 @@ existing output directories, native non-zero exits, native error diagnostics,
 timeouts, links, empty exports, and configured limit violations fail the typed
 job. Partial staging data is removed, and the requested destination remains
 absent.
+
+The read-only doctor/verify surface separately fails closed when the executable
+or Core prerequisite is missing, the supplied Material Maker version is unknown
+or earlier than 1.7, or the bounded native readiness probe fails. It never
+infers the Material Maker product release from Godot's engine version.
 
 ## Non-goals
 

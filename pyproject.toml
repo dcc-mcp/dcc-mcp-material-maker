@@ -34,7 +34,7 @@ packages = ["src/dcc_mcp_material_maker"]
 artifacts = ["src/dcc_mcp_material_maker/skills/**"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/dcc_mcp_material_maker", "docs", "tests", "README.md", "LICENSE", "CHANGELOG.md", "tools"]
+include = ["src/dcc_mcp_material_maker", "docs", "tests", "README.md", "install.md", "LICENSE", "CHANGELOG.md", "tools"]
 exclude = ["docs/**/*.png", "docs/**/*.svg", "docs/**/*.webp"]
 
 [tool.pytest.ini_options]
