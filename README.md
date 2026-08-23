@@ -37,13 +37,19 @@ contract. Use Material Maker itself when visible node editing is required.
 - `dcc-mcp-core` 0.19.38 or newer
 - Material Maker 1.7 for native export
 
-Install the adapter and point it at the official Material Maker executable:
+Follow [Installation](install.md) for the supported wheel lifecycle, three-platform
+configuration, JSON verification, upgrade, uninstall, and troubleshooting contract.
+The adapter wheel is not currently published to PyPI; do not treat the package name
+as an available public pip install until the release artifact and Core catalog entry exist.
+
+After installing a trusted, digest-verified wheel, point the adapter at the official
+Material Maker executable and report its product release version:
 
 ```bash
-pip install dcc-mcp-material-maker
 export DCC_MCP_MATERIAL_MAKER_EXECUTABLE=/opt/material-maker/material_maker
+export DCC_MCP_MATERIAL_MAKER_VERSION=1.7
 export DCC_MCP_MATERIAL_MAKER_ALLOWED_ROOTS=/workspace/materials
-dcc-mcp-material-maker-doctor
+dcc-mcp-material-maker verify --json
 dcc-mcp-material-maker
 ```
 

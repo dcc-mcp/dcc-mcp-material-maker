@@ -112,7 +112,13 @@ def stop_server() -> None:
         _server = None
 
 
-def main() -> None:
+def main(argv: Optional[list[str]] = None) -> None:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] in {"doctor", "verify"}:
+        from .install import main as diagnostic_main
+
+        diagnostic_main(args, program="dcc-mcp-material-maker")
+        return
     stopped = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stopped.set())
     if hasattr(signal, "SIGTERM"):
