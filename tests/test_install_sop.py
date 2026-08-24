@@ -133,6 +133,76 @@ def test_unknown_version_remediation_preserves_probe_without_fabricating_a_relea
     assert "--material-maker-version" not in command
     assert "1.7.0" not in command
 
+    monkeypatch.setattr("builtins.input", lambda _prompt: "1.7.2")
+    remediated_code, remediated = _invoke(command[1:], capsys)
+    assert remediated_code == install.EXIT_OK
+    assert remediated["verify"]["directly_usable"] is True
+    assert remediated["host"]["version"] == "1.7.2"
+
+
+def test_missing_probe_remediation_collects_exact_path_and_advances_to_readiness(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setattr(install, "MaterialMakerCli", ReadyCli)
+    root = tmp_path / "managed"
+    executable = tmp_path / "material_maker"
+    executable.write_bytes(b"host")
+    project = _project(tmp_path / "probe.ptex")
+
+    code, report = _invoke(
+        [
+            "verify",
+            "--json",
+            "--install-root",
+            str(root),
+            "--executable",
+            str(executable),
+            "--material-maker-version",
+            "1.7.2",
+        ],
+        capsys,
+    )
+
+    assert code == install.EXIT_VERIFY
+    assert report["verify"]["failure_reason"] == "probe_project_required"
+    command = report["next_steps"][0]["command"]
+    assert command[1] == "configure"
+    assert "--probe-project" not in command
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: str(project))
+    remediated_code, remediated = _invoke(command[1:], capsys)
+    assert remediated_code == install.EXIT_OK
+    assert remediated["verify"]["directly_usable"] is True
+    assert remediated["config"]["probe_project"] == str(project.resolve())
+
+
+def test_bounded_configuration_reports_noninteractive_input_as_stable_json(
+    monkeypatch, tmp_path, capsys
+):
+    executable = tmp_path / "material_maker"
+    executable.write_bytes(b"host")
+
+    def end_input(_prompt):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", end_input)
+
+    code, report = _invoke(
+        [
+            "configure",
+            "--json",
+            "--install-root",
+            str(tmp_path / "managed"),
+            "--executable",
+            str(executable),
+        ],
+        capsys,
+    )
+
+    assert code == install.EXIT_VERIFY
+    assert report["verify"]["failure_reason"] == "operator_configuration_cancelled"
+    assert report["next_steps"] == []
+
 
 @pytest.mark.parametrize(
     "value",
@@ -293,6 +363,8 @@ def test_uninstall_is_plan_first_and_removes_only_verified_managed_root(
     assert code == 0
     assert result["receipt_path"] is None
     assert not root.exists()
+    assert not list(tmp_path.glob(".managed.uninstall-*"))
+    assert not list(tmp_path.glob(".managed.uninstall-backup-*"))
 
 
 def test_second_uninstall_is_a_successful_noop(monkeypatch, tmp_path, capsys):
