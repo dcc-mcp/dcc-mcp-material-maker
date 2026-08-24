@@ -6,7 +6,7 @@ description: >-
   for Blender, Godot, Unity, or Unreal pipelines. Do not use for interactive
   Material Maker GUI control or arbitrary shader execution.
 license: MIT
-compatibility: "Python 3.9+; Material Maker 1.7.0+; dcc-mcp-core 0.19.38+"
+compatibility: "Python 3.9+; Material Maker 1.7.0+; dcc-mcp-core 0.20.14+"
 allowed-tools: "python"
 metadata:
   dcc-mcp:

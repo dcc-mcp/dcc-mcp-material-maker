@@ -12,6 +12,25 @@ from dcc_mcp_material_maker.bridge import MaterialMakerError
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_published_install_sop_core_floor_is_projected_everywhere():
+    expected = "0.20.14"
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    runbook = (ROOT / "install.md").read_text(encoding="utf-8")
+    skill = (
+        ROOT / "src" / "dcc_mcp_material_maker" / "skills" / "material-maker-materials" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+    assert install.MIN_CORE_VERSION == expected
+    assert "dcc-mcp-core>={},<1.0.0".format(expected) in pyproject.replace(" ", "")
+    assert "dcc-mcp-core` {} or newer".format(expected) in readme
+    assert "dcc-mcp-core>={},<1.0.0".format(expected) in runbook.replace(" ", "")
+    assert "dcc-mcp-core {}+".format(expected) in skill
+    assert 'DCC_MCP_CORE_FLOOR: "{}"'.format(expected) in workflow
+    assert "dcc-mcp-core==${DCC_MCP_CORE_FLOOR}" in workflow
+
+
 def test_standard_doctor_json_reports_missing_executable_as_preflight_failure(tmp_path, capsys):
     missing = tmp_path / "material_maker"
 
@@ -37,7 +56,7 @@ def test_standard_doctor_json_reports_missing_executable_as_preflight_failure(tm
     }
     assert report["config"]["requested_executable"] == str(missing)
     assert report["runtime"]["python_executable"] == sys.executable
-    assert report["core"]["minimum_version"] == "0.19.38"
+    assert report["core"]["minimum_version"] == "0.20.14"
     assert report["host"]["minimum_version"] == "1.7.0"
 
 
@@ -112,7 +131,7 @@ def test_verify_success_reports_runtime_core_endpoint_and_config(monkeypatch, tm
     assert report["failure"] is None
     assert report["next_steps"] == []
     assert report["host"]["satisfies_minimum"] is True
-    assert report["core"]["minimum_version"] == "0.19.38"
+    assert report["core"]["minimum_version"] == "0.20.14"
     assert report["core"]["satisfies_minimum"] is True
     assert report["endpoint"] == {
         "kind": "native_cli",
@@ -136,7 +155,7 @@ def test_doctor_rejects_unsupported_core_before_claiming_usable(monkeypatch, tmp
             return {"ready": True, "engine": {"returncode": 0}}
 
     monkeypatch.setattr(install, "MaterialMakerCli", ReadyMaterialMakerCli)
-    monkeypatch.setattr(install.metadata, "version", lambda _name: "0.19.37")
+    monkeypatch.setattr(install.metadata, "version", lambda _name: "0.20.13")
 
     with pytest.raises(SystemExit) as raised:
         server.main(

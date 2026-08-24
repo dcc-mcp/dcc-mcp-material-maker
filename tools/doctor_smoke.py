@@ -9,16 +9,10 @@ import sys
 import tempfile
 from pathlib import Path
 
+from dcc_mcp_core.deployment import load_install_sop_schema
 from jsonschema import Draft202012Validator
 
-SCHEMA_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "src"
-    / "dcc_mcp_material_maker"
-    / "schemas"
-    / "adapter-install-sop-v1.schema.json"
-)
-SCHEMA = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+SCHEMA = load_install_sop_schema()
 
 
 def _check(args: list[str], expected_exit: int) -> None:
