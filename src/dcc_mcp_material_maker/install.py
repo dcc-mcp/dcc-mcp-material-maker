@@ -309,13 +309,23 @@ def _read_receipt(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
             raise InstallStateError("receipt_invalid", "Owned-file digest is invalid")
         if candidate.stat().st_size != size or _sha256_file(candidate) != digest:
             raise InstallStateError("receipt_integrity_failed", "Owned file digest does not match")
-    actual = {
-        candidate.relative_to(root)
-        for candidate in root.rglob("*")
-        if candidate.is_file() and candidate != path
-    }
-    if actual != owned:
-        raise InstallStateError("receipt_integrity_failed", "Managed root contains unowned files")
+    expected_files = owned | {_RECEIPT_RELATIVE}
+    expected_directories: set[Path] = set()
+    for relative in expected_files:
+        parent = relative.parent
+        while parent != Path("."):
+            expected_directories.add(parent)
+            parent = parent.parent
+    actual_entries: set[Path] = set()
+    for candidate in root.rglob("*"):
+        relative = candidate.relative_to(root)
+        actual_entries.add(relative)
+        if candidate.is_symlink():
+            raise InstallStateError(
+                "receipt_integrity_failed", "Managed root contains an unowned symbolic link"
+            )
+    if actual_entries != expected_files | expected_directories:
+        raise InstallStateError("receipt_integrity_failed", "Managed root contains unowned paths")
     if owned != {Path(_CONFIG_NAME)}:
         raise InstallStateError("receipt_invalid", "Owned-file set is not recognized")
     try:
@@ -346,7 +356,7 @@ def _new_state(root: Path, config: dict[str, Any]) -> tuple[bytes, bytes]:
     return config_bytes, _json_bytes(receipt)
 
 
-def _publish_state(root: Path, config: dict[str, Any]) -> None:
+def _publish_state(root: Path, config: dict[str, Any]) -> Optional[Path]:
     root.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".%s.staging-" % root.name, dir=str(root.parent)))
     backup = root.parent / (".%s.backup-%s" % (root.name, uuid.uuid4().hex))
@@ -366,24 +376,37 @@ def _publish_state(root: Path, config: dict[str, Any]) -> None:
             if moved_existing and backup.exists() and not root.exists():
                 os.replace(backup, root)
             raise
-        if backup.exists():
-            shutil.rmtree(backup)
+        return backup if moved_existing else None
     finally:
         if staging.exists():
             shutil.rmtree(staging)
-        if backup.exists() and root.exists():
-            shutil.rmtree(backup)
+
+
+def _rollback_published_state(root: Path, backup: Optional[Path]) -> None:
+    discarded = root.parent / (".%s.failed-%s" % (root.name, uuid.uuid4().hex))
+    if root.exists():
+        os.replace(root, discarded)
+    if backup is not None and backup.exists():
+        os.replace(backup, root)
+    if discarded.exists():
+        shutil.rmtree(discarded, ignore_errors=True)
 
 
 def _remove_state(root: Path) -> None:
     quarantine = root.parent / (".%s.uninstall-%s" % (root.name, uuid.uuid4().hex))
-    os.replace(root, quarantine)
+    backup = root.parent / (".%s.uninstall-backup-%s" % (root.name, uuid.uuid4().hex))
+    shutil.copytree(root, backup, copy_function=shutil.copy2)
     try:
-        shutil.rmtree(quarantine)
-    except OSError:
-        if quarantine.exists() and not root.exists():
-            os.replace(quarantine, root)
-        raise
+        os.replace(root, quarantine)
+        try:
+            shutil.rmtree(quarantine)
+        except OSError:
+            if backup.exists() and not root.exists():
+                os.replace(backup, root)
+            raise
+    finally:
+        if backup.exists() and root.exists():
+            shutil.rmtree(backup)
 
 
 def _configured(args: argparse.Namespace, stored: Optional[dict[str, Any]]) -> dict[str, Any]:
@@ -510,7 +533,7 @@ def _preflight_config(
                         args.command,
                         root,
                         executable=cli.executable,
-                        host_version=MIN_MATERIAL_MAKER_VERSION,
+                        probe_project=config.get("probe_project"),
                     ),
                 )
             ],
@@ -672,9 +695,11 @@ def _run_install(report: dict[str, Any], args: argparse.Namespace, root: Path) -
         ]
         _emit(report, EXIT_OK, status="planned")
         return
-    if existing is None or config != existing:
+    published = existing is None or config != existing
+    backup: Optional[Path] = None
+    if published:
         try:
-            _publish_state(root, config)
+            backup = _publish_state(root, config)
         except OSError as exc:
             _fail(
                 report,
@@ -683,15 +708,37 @@ def _run_install(report: dict[str, Any], args: argparse.Namespace, root: Path) -
                 "transaction_publish_failed",
                 detail=type(exc).__name__,
             )
-    _state_or_failure(report, root, exit_code=EXIT_INSTALL)
-    report["steps"].append(
-        {"id": args.command, "status": "ok", "message": "Managed state published atomically."}
-    )
-    _verify_host(report, args, root, config)
+    try:
+        _state_or_failure(report, root, exit_code=EXIT_INSTALL)
+        report["steps"].append(
+            {
+                "id": args.command,
+                "status": "ok",
+                "message": "Managed state published atomically.",
+            }
+        )
+        _verify_host(report, args, root, config)
+        if backup is not None and backup.exists():
+            shutil.rmtree(backup)
+    except BaseException:
+        if published:
+            _rollback_published_state(root, backup)
+        raise
     _emit(report, EXIT_OK)
 
 
 def _run_uninstall(report: dict[str, Any], args: argparse.Namespace, root: Path) -> None:
+    if not root.exists():
+        report["receipt_path"] = None
+        report["steps"].append(
+            {
+                "id": "uninstall",
+                "status": "already_absent",
+                "message": "Managed state is already absent.",
+            }
+        )
+        _emit(report, EXIT_OK)
+        return
     config = _state_or_failure(report, root, exit_code=EXIT_INSTALL)
     _apply_config_to_report(report, config, args)
     if not args.execute:

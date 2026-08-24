@@ -76,6 +76,27 @@ def test_status_rejects_exit_zero_without_material_maker_artifacts(tmp_path):
         cli.status(probe_project=str(project))
 
 
+def test_status_rejects_exit_zero_with_only_zero_byte_export_artifacts(tmp_path):
+    class ZeroByteExportCli(FakeMaterialMakerCli):
+        def _run(self, args, timeout_secs):
+            output = Path(args[args.index("--output-dir") + 1])
+            (output / "empty.png").write_bytes(b"")
+            return {
+                "returncode": 0,
+                "duration_secs": 0.01,
+                "stdout": "Done\n",
+                "stderr": "",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+            }
+
+    project = write_project(tmp_path / "probe.ptex")
+    cli = ZeroByteExportCli(tmp_path)
+
+    with pytest.raises(MaterialMakerError, match="empty export file"):
+        cli.status(probe_project=str(project))
+
+
 def test_status_without_probe_project_fails_closed(tmp_path):
     cli = FakeMaterialMakerCli(tmp_path)
     status = cli.status()
