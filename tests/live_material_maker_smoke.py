@@ -1,4 +1,4 @@
-"""Exercise Material Maker 1.7 and every bundled typed MCP tool."""
+"""Exercise Material Maker 1.7.0+ and every bundled typed MCP tool."""
 
 from __future__ import annotations
 
@@ -113,7 +113,11 @@ def main() -> None:
                 )
             }
 
-            status = call(server.mcp_url, required["get_status"])
+            status = call(
+                server.mcp_url,
+                required["get_status"],
+                {"probe_project": str(sample)},
+            )
             inspected = call(
                 server.mcp_url,
                 required["inspect_project"],

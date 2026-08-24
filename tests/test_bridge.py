@@ -61,10 +61,27 @@ def test_status_reports_missing_executable(tmp_path):
 
 def test_status_uses_bounded_native_probe(tmp_path):
     cli = FakeMaterialMakerCli(tmp_path)
-    status = cli.status()
+    project = write_project(tmp_path / "probe.ptex")
+    status = cli.status(probe_project=str(project))
     assert status["ready"] is True
     assert status["driver"] == "official_material_maker_cli"
     assert cli.calls[0][0][0] == "--export-material"
+    assert status["readiness_evidence"]["output_file_count"] == 2
+
+
+def test_status_rejects_exit_zero_without_material_maker_artifacts(tmp_path):
+    project = write_project(tmp_path / "probe.ptex")
+    cli = FakeMaterialMakerCli(tmp_path, file_count=0)
+    with pytest.raises(MaterialMakerError, match="no export files"):
+        cli.status(probe_project=str(project))
+
+
+def test_status_without_probe_project_fails_closed(tmp_path):
+    cli = FakeMaterialMakerCli(tmp_path)
+    status = cli.status()
+    assert status["ready"] is False
+    assert status["reason"] == "probe_project_required"
+    assert not cli.calls
 
 
 def test_inspect_and_validate_project(tmp_path):

@@ -59,6 +59,8 @@ Material Maker's general argument surface.
 | `DCC_MCP_MATERIAL_MAKER_MAX_EXPORT_BYTES` | 2 GiB | Maximum aggregate export size. |
 | `DCC_MCP_MATERIAL_MAKER_MAX_TIMEOUT_SECS` | 1,800 | Maximum native process deadline. |
 | `DCC_MCP_MATERIAL_MAKER_VERSION` | unset | Operator-supplied product release required for verify-to-usable; the native CLI has no documented product-version verb. |
+| `DCC_MCP_MATERIAL_MAKER_PROBE_PROJECT` | unset | Trusted `.ptex` loaded for the transient readiness export. |
+| `DCC_MCP_MATERIAL_MAKER_INSTALL_ROOT` | platform user-data path | Dedicated adapter config and root-bound receipt. |
 
 ## Failure semantics
 
@@ -69,13 +71,21 @@ job. Partial staging data is removed, and the requested destination remains
 absent.
 
 The read-only doctor/verify surface separately fails closed when the executable
-or Core prerequisite is missing, the supplied Material Maker version is unknown
-or earlier than 1.7, or the bounded native readiness probe fails. It never
-infers the Material Maker product release from Godot's engine version.
+or Core prerequisite is missing, the supplied Material Maker version is not a
+canonical final `X.Y.Z` release at 1.7.0 or newer, the trusted `.ptex` is absent,
+or the bounded native readiness export produces no validated artifacts. Exit
+zero alone is not readiness. The probe reads the project and writes only to a
+temporary sibling directory that is removed afterward. It never infers the
+Material Maker product release from Godot's engine version.
+
+Install, upgrade, and uninstall are plan-first. The managed receipt is bound to
+the resolved dedicated root and hashes every owned file. Replacement uses a
+complete staging root, atomic rename, and rollback; copied, tampered, partial,
+or unowned state fails closed before replacement or removal.
 
 ## Non-goals
 
-- installing or patching Material Maker;
+- installing or patching the Material Maker application;
 - controlling the visible editor or editing graphs interactively;
 - evaluating caller-supplied GDScript, GLSL, Python, or shell commands;
 - importing exported textures into Blender or Godot on the caller's behalf.
