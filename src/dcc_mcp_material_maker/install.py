@@ -25,7 +25,7 @@ EXIT_ACQUIRE = 20
 EXIT_INSTALL = 30
 EXIT_VERIFY = 40
 EXIT_REQUIRES_RESTART = 50
-MIN_CORE_VERSION = "0.19.38"
+MIN_CORE_VERSION = "0.20.14"
 MIN_MATERIAL_MAKER_VERSION = "1.7.0"
 
 _VERSION_COMPONENT = r"(?:0|[1-9][0-9]{0,5})"
@@ -265,7 +265,7 @@ def _base_report(args: argparse.Namespace, root: Path, program: Optional[str]) -
             "persistent_writes": args.command in {"install", "upgrade", "uninstall"}
             and args.execute,
         },
-        "schema_source": "bundled_core_2320_compatibility",
+        "schema_source": "dcc_mcp_core.deployment",
     }
 
 
@@ -529,7 +529,7 @@ def _preflight_config(
                     "upgrade_dcc_mcp_core",
                     "Install a supported dcc-mcp-core release.",
                     "This adapter requires the documented Core floor.",
-                    [sys.executable, "-m", "pip", "install", "dcc-mcp-core==0.19.38"],
+                    [sys.executable, "-m", "pip", "install", "dcc-mcp-core==0.20.14"],
                 )
             ],
         )

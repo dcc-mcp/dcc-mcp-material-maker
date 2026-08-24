@@ -1,22 +1,28 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 from pathlib import Path
 
 import pytest
+from dcc_mcp_core.deployment import install_sop as core_install_sop
+from dcc_mcp_core.deployment import load_install_sop_schema
 from jsonschema import Draft202012Validator
 
 from dcc_mcp_material_maker import install, server
 
 SCHEMA_PATH = (
-    Path(install.__file__).resolve().parent / "schemas" / "adapter-install-sop-v1.schema.json"
+    Path(core_install_sop.__file__).resolve().parent.parent
+    / "schemas"
+    / "adapter-install-sop-v1.schema.json"
 )
 
 
 def _schema() -> dict:
-    value = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    value = load_install_sop_schema()
+    assert value == json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
     Draft202012Validator.check_schema(value)
     return value
 
@@ -485,15 +491,35 @@ def test_uninstall_rejects_unowned_empty_directory_without_removing_anything(
     assert root.is_dir()
 
 
-def test_schema_is_packaged_and_matches_core_compatibility_contract():
+def test_schema_matches_published_core_contract():
     schema = _schema()
     assert schema["$id"] == "https://dcc-mcp.github.io/schemas/adapter-install-sop-v1.schema.json"
-    pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8")
-    assert "src/dcc_mcp_material_maker/schemas/**" in pyproject
     assert install._sha256_file(SCHEMA_PATH) == (
         "3ca25788439917b4d4c0617230a762f9797756b5b54f45c8c4149f975b90f904"
     )
     assert SCHEMA_PATH.stat().st_size == 4261
+
+
+def test_install_sop_schema_comes_only_from_published_core():
+    root = Path(__file__).resolve().parents[1]
+    published_path = (
+        Path(core_install_sop.__file__).resolve().parent.parent
+        / "schemas"
+        / "adapter-install-sop-v1.schema.json"
+    )
+    raw = published_path.read_bytes()
+
+    assert len(raw) == 4261
+    assert hashlib.sha256(raw).hexdigest() == (
+        "3ca25788439917b4d4c0617230a762f9797756b5b54f45c8c4149f975b90f904"
+    )
+    assert load_install_sop_schema() == json.loads(raw)
+    assert not (
+        root / "src" / "dcc_mcp_material_maker" / "schemas" / "adapter-install-sop-v1.schema.json"
+    ).exists()
+    assert "src/dcc_mcp_material_maker/schemas/**" not in (root / "pyproject.toml").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_status_skill_requires_a_material_maker_specific_probe_project():

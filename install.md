@@ -16,7 +16,7 @@ https://raw.githubusercontent.com/dcc-mcp/dcc-mcp-material-maker/main/install.md
 ## Requirements
 
 - Python 3.9 or newer.
-- `dcc-mcp-core>=0.19.38,<1.0.0`.
+- `dcc-mcp-core>=0.20.14,<1.0.0`.
 - An official Material Maker final release 1.7.0 or newer.
 - A trusted adapter wheel named
   `dcc_mcp_material_maker-<version>-py3-none-any.whl` and its published
@@ -35,15 +35,14 @@ local, prefixed, whitespace-padded, and oversized version strings fail closed.
 | Windows | Python 3.9+ and official Material Maker 1.7.0+ executable |
 | macOS | Python 3.9+ and official Material Maker 1.7.0+ executable |
 | Linux | Python 3.9+ and official Material Maker 1.7.0+ executable |
-| DCC-MCP Core | `>=0.19.38,<1.0.0` |
+| DCC-MCP Core | `>=0.20.14,<1.0.0` |
 
 Material Maker stays user- or OS-package-manager-owned. The adapter does not download or cache Material Maker, scrape a latest release, accept an unpinned
 artifact, execute arbitrary scripts, or fall back to UI automation.
 
-The Install SOP v1 JSON schema is bundled byte-for-byte as a compatibility
-resource while the official Core export is pending in
-`dcc-mcp/dcc-mcp-core#2320`. Final merge still waits for that Core dependency
-and its published compatibility floor.
+The Install SOP v1 JSON schema is loaded from the canonical resource published
+by `dcc-mcp-core` 0.20.14 or newer. Source and installed-wheel tests validate
+the exact public loader and resource; the adapter carries no fallback copy.
 
 ## Agent quick path
 

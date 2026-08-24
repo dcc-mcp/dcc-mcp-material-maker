@@ -34,7 +34,7 @@ contract. Use Material Maker itself when visible node editing is required.
 ## Requirements
 
 - Python 3.9 or newer
-- `dcc-mcp-core` 0.19.38 or newer
+- `dcc-mcp-core` 0.20.14 or newer
 - Material Maker 1.7.0 or newer for native export
 
 Follow [Installation](install.md) for the supported wheel lifecycle, three-platform
