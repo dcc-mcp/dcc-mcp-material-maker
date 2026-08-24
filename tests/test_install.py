@@ -189,7 +189,8 @@ def test_verify_requires_explicit_product_version_when_native_cli_cannot_report_
         "stage": "verify",
         "reason": "material_maker_version_unknown",
     }
-    assert "--material-maker-version" in report["next_steps"][0]["command"]
+    assert "--material-maker-version" not in report["next_steps"][0]["command"]
+    assert "1.7.0" not in report["next_steps"][0]["command"]
 
 
 def test_verify_converts_native_probe_error_to_stable_verify_failure(monkeypatch, tmp_path, capsys):

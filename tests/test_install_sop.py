@@ -104,6 +104,36 @@ def test_missing_executable_is_schema_valid_and_has_no_placeholder(tmp_path, cap
         assert ("command" in step) ^ ("file_edit" in step)
 
 
+def test_unknown_version_remediation_preserves_probe_without_fabricating_a_release(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setattr(install, "MaterialMakerCli", ReadyCli)
+    root = tmp_path / "managed"
+    executable = tmp_path / "material_maker"
+    executable.write_bytes(b"host")
+    project = _project(tmp_path / "probe.ptex")
+
+    code, report = _invoke(
+        [
+            "verify",
+            "--json",
+            "--install-root",
+            str(root),
+            "--executable",
+            str(executable),
+            "--probe-project",
+            str(project),
+        ],
+        capsys,
+    )
+
+    assert code == install.EXIT_VERIFY
+    command = report["next_steps"][0]["command"]
+    assert command[command.index("--probe-project") + 1] == str(project.resolve())
+    assert "--material-maker-version" not in command
+    assert "1.7.0" not in command
+
+
 @pytest.mark.parametrize(
     "value",
     [
@@ -208,6 +238,39 @@ def test_upgrade_rolls_back_when_atomic_publish_fails(monkeypatch, tmp_path, cap
     assert after == before
 
 
+def test_upgrade_rolls_back_when_new_state_fails_host_verification(monkeypatch, tmp_path, capsys):
+    class FailSecondProbeCli(ReadyCli):
+        probes = 0
+
+        def status(self, probe_project=None):
+            type(self).probes += 1
+            if type(self).probes == 2:
+                raise install.MaterialMakerError("injected upgraded host probe failure")
+            return super().status(probe_project=probe_project)
+
+    monkeypatch.setattr(install, "MaterialMakerCli", FailSecondProbeCli)
+    root = tmp_path / "managed"
+    executable = tmp_path / "material_maker"
+    executable.write_bytes(b"host")
+    project = _project(tmp_path / "probe.ptex")
+    _invoke(_install_args(root, executable, project, "--execute"), capsys)
+    before = {
+        path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()
+    }
+
+    argv = _install_args(root, executable, project, "--execute")
+    argv[0] = "upgrade"
+    argv[argv.index("--material-maker-version") + 1] = "1.8.0"
+    code, report = _invoke(argv, capsys)
+
+    assert code == install.EXIT_VERIFY
+    assert report["verify"]["failure_reason"] == "native_probe_failed"
+    after = {
+        path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()
+    }
+    assert after == before
+
+
 def test_uninstall_is_plan_first_and_removes_only_verified_managed_root(
     monkeypatch, tmp_path, capsys
 ):
@@ -230,6 +293,61 @@ def test_uninstall_is_plan_first_and_removes_only_verified_managed_root(
     assert code == 0
     assert result["receipt_path"] is None
     assert not root.exists()
+
+
+def test_second_uninstall_is_a_successful_noop(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(install, "MaterialMakerCli", ReadyCli)
+    root = tmp_path / "managed"
+    executable = tmp_path / "material_maker"
+    executable.write_bytes(b"host")
+    project = _project(tmp_path / "probe.ptex")
+    _invoke(_install_args(root, executable, project, "--execute"), capsys)
+    _invoke(["uninstall", "--json", "--install-root", str(root), "--execute"], capsys)
+
+    code, report = _invoke(
+        ["uninstall", "--json", "--install-root", str(root), "--execute"], capsys
+    )
+
+    assert code == install.EXIT_OK
+    assert report["status"] == "ok"
+    assert report["receipt_path"] is None
+    assert report["steps"][-1] == {
+        "id": "uninstall",
+        "status": "already_absent",
+        "message": "Managed state is already absent.",
+    }
+
+
+def test_failed_uninstall_cleanup_restores_from_an_intact_backup(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(install, "MaterialMakerCli", ReadyCli)
+    root = tmp_path / "managed"
+    executable = tmp_path / "material_maker"
+    executable.write_bytes(b"host")
+    project = _project(tmp_path / "probe.ptex")
+    _invoke(_install_args(root, executable, project, "--execute"), capsys)
+    before = {
+        path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()
+    }
+    real_rmtree = shutil.rmtree
+
+    def partially_remove_then_fail(path, *args, **kwargs):
+        candidate = Path(path)
+        if ".uninstall-" in candidate.name:
+            (candidate / "adapter.json").unlink()
+            raise OSError("injected partial quarantine deletion")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(install.shutil, "rmtree", partially_remove_then_fail)
+    code, report = _invoke(
+        ["uninstall", "--json", "--install-root", str(root), "--execute"], capsys
+    )
+
+    assert code == install.EXIT_INSTALL
+    assert report["verify"]["failure_reason"] == "transaction_uninstall_failed"
+    after = {
+        path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()
+    }
+    assert after == before
 
 
 def test_repeated_install_reuses_identical_verified_state(monkeypatch, tmp_path, capsys):
@@ -271,6 +389,28 @@ def test_uninstall_rejects_unowned_file_without_removing_anything(monkeypatch, t
     assert code == install.EXIT_INSTALL
     assert report["verify"]["failure_reason"] == "receipt_integrity_failed"
     assert unrelated.read_text(encoding="utf-8") == "keep"
+
+
+def test_uninstall_rejects_unowned_empty_directory_without_removing_anything(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setattr(install, "MaterialMakerCli", ReadyCli)
+    root = tmp_path / "managed"
+    executable = tmp_path / "material_maker"
+    executable.write_bytes(b"host")
+    project = _project(tmp_path / "probe.ptex")
+    _invoke(_install_args(root, executable, project, "--execute"), capsys)
+    unrelated = root / "user-empty-directory"
+    unrelated.mkdir()
+
+    code, report = _invoke(
+        ["uninstall", "--json", "--install-root", str(root), "--execute"], capsys
+    )
+
+    assert code == install.EXIT_INSTALL
+    assert report["verify"]["failure_reason"] == "receipt_integrity_failed"
+    assert unrelated.is_dir()
+    assert root.is_dir()
 
 
 def test_schema_is_packaged_and_matches_core_compatibility_contract():

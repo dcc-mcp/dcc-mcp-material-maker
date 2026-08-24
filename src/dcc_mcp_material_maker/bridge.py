@@ -459,6 +459,8 @@ class MaterialMakerCli:
                     continue
                 relative = candidate.relative_to(staging).as_posix()
                 size = candidate.stat().st_size
+                if size <= 0:
+                    raise MaterialMakerError("Material Maker produced an empty export file")
                 total_bytes += size
                 if len(files) >= self.max_export_files:
                     raise MaterialMakerError("Export exceeds the configured file-count limit")
