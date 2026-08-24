@@ -23,7 +23,7 @@ in-process plug-in, loopback bridge, arbitrary GDScript, shader, or shell input.
 
 | Typed tool | Contract |
 | --- | --- |
-| `get_status` | Discover the native executable and optionally run a bounded headless readiness probe. |
+| `get_status` | Load a trusted `.ptex` and require bounded transient export artifacts from the native executable. |
 | `inspect_project` | Report file hash, graph/node/connection counts, material outputs, and node types. |
 | `validate_project` | Check graph structure, unique node names, endpoints, ports, and configured limits. |
 | `export_material` | Export one valid `.ptex` project into a new staging-backed output directory. |
@@ -35,7 +35,7 @@ contract. Use Material Maker itself when visible node editing is required.
 
 - Python 3.9 or newer
 - `dcc-mcp-core` 0.19.38 or newer
-- Material Maker 1.7 for native export
+- Material Maker 1.7.0 or newer for native export
 
 Follow [Installation](install.md) for the supported wheel lifecycle, three-platform
 configuration, JSON verification, upgrade, uninstall, and troubleshooting contract.
@@ -43,13 +43,17 @@ The adapter wheel is not currently published to PyPI; do not treat the package n
 as an available public pip install until the release artifact and Core catalog entry exist.
 
 After installing a trusted, digest-verified wheel, point the adapter at the official
-Material Maker executable and report its product release version:
+Material Maker executable, report its canonical product release, and choose a
+trusted `.ptex` readiness project:
 
 ```bash
 export DCC_MCP_MATERIAL_MAKER_EXECUTABLE=/opt/material-maker/material_maker
-export DCC_MCP_MATERIAL_MAKER_VERSION=1.7
+export DCC_MCP_MATERIAL_MAKER_VERSION=1.7.0
+export DCC_MCP_MATERIAL_MAKER_PROBE_PROJECT=/workspace/materials/readiness.ptex
 export DCC_MCP_MATERIAL_MAKER_ALLOWED_ROOTS=/workspace/materials
-dcc-mcp-material-maker verify --json
+dcc-mcp-material-maker install --json --install-root /workspace/dcc-mcp-material-maker
+# Review the schema-valid plan, then execute its exact next_steps[].command.
+dcc-mcp-material-maker verify --json --install-root /workspace/dcc-mcp-material-maker
 dcc-mcp-material-maker
 ```
 
@@ -67,6 +71,8 @@ executable variable is omitted.
 - supports Core cancellation and terminates timed-out child processes;
 - exports into a private staging directory, rejects links and empty output,
   hashes every file, and atomically exposes only a complete new directory;
+- treats process exit zero without a validated `.ptex` and nonempty bounded
+  export artifacts as not ready;
 - never overwrites an existing export directory.
 
 See [Architecture](docs/architecture.md) for trust boundaries and configuration.

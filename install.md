@@ -1,14 +1,13 @@
 # Install DCC-MCP Material Maker
 
-This adapter is a standalone Python service around Material Maker's documented
-command-line exporter. Nothing is copied into the Material Maker application.
-The adapter does not install, update, or patch Material Maker.
+This adapter wraps Material Maker's documented command-line exporter. Its
+Install SOP manages only a dedicated adapter configuration and receipt. It
+never installs, updates, patches, or removes Material Maker itself.
 
 The adapter wheel is not currently published to PyPI. Do not claim that
 `pip install dcc-mcp-material-maker` works until a release wheel is published
 and the DCC-MCP Core catalog contains its immutable URL and SHA-256 digest.
-
-The catalog instructions URL for this runbook is:
+The canonical runbook URL is:
 
 ```text
 https://raw.githubusercontent.com/dcc-mcp/dcc-mcp-material-maker/main/install.md
@@ -17,63 +16,62 @@ https://raw.githubusercontent.com/dcc-mcp/dcc-mcp-material-maker/main/install.md
 ## Requirements
 
 - Python 3.9 or newer.
-- `dcc-mcp-core` 0.19.38 or newer and earlier than 1.0.0.
-- The official Material Maker application, version 1.7 or newer.
-- A trusted adapter wheel file named like
-  `dcc_mcp_material_maker-<version>-py3-none-any.whl` and its publisher-provided
+- `dcc-mcp-core>=0.19.38,<1.0.0`.
+- An official Material Maker final release 1.7.0 or newer.
+- A trusted adapter wheel named
+  `dcc_mcp_material_maker-<version>-py3-none-any.whl` and its published
   SHA-256 digest.
-- An absolute path to the Material Maker executable and the installed Material
-  Maker release version.
+- Absolute paths to the Material Maker executable and a trusted `.ptex`
+  readiness project.
 
-Material Maker's documented command-line contract does not expose a product
-version verb. The verify command therefore requires the operator to supply the
-release version from the trusted application package or package manager. It
-does not infer the product version from the bundled Godot runtime.
+Material Maker has no documented product-version verb. Supply the canonical
+`X.Y.Z` release from the trusted package or package manager. Prerelease,
+local, prefixed, whitespace-padded, and oversized version strings fail closed.
 
 ## Supported versions
 
 | Surface | Supported contract |
 | --- | --- |
-| Windows | Python 3.9+ and official Material Maker 1.7+ executable |
-| macOS | Python 3.9+ and official Material Maker 1.7+ application executable |
-| Linux | Python 3.9+ and official Material Maker 1.7+ executable |
+| Windows | Python 3.9+ and official Material Maker 1.7.0+ executable |
+| macOS | Python 3.9+ and official Material Maker 1.7.0+ executable |
+| Linux | Python 3.9+ and official Material Maker 1.7.0+ executable |
 | DCC-MCP Core | `>=0.19.38,<1.0.0` |
 
-Material Maker is user- or OS-package-manager-owned. This adapter never
-scrapes a latest release, auto-provisions an external binary, or accepts an
-unpinned download on the user's behalf. It does not download or cache Material Maker,
-so there is no adapter-owned binary cache to upgrade or clean.
+Material Maker stays user- or OS-package-manager-owned. The adapter does not download or cache Material Maker, scrape a latest release, accept an unpinned
+artifact, execute arbitrary scripts, or fall back to UI automation.
+
+The Install SOP v1 JSON schema is bundled byte-for-byte as a compatibility
+resource while the official Core export is pending in
+`dcc-mcp/dcc-mcp-core#2320`. Final merge still waits for that Core dependency
+and its published compatibility floor.
 
 ## Agent quick path
 
-1. Stop if an immutable adapter wheel URL and its expected SHA-256 digest are
-   not available. The current absence of a PyPI wheel and Core catalog install
-   block is an external release dependency, not permission to use an editable
-   checkout or scrape a latest artifact.
-2. Download the exact wheel through the operator-approved artifact channel and
-   verify its SHA-256 digest before installation.
-3. Install that local wheel with the same Python interpreter that will run the
-   adapter:
+1. Obtain the exact wheel through an operator-approved channel and verify its
+   published SHA-256 before installing it. The absent PyPI/catalog release is
+   not permission to use an editable checkout or an unaudited download.
+2. Install the local wheel with the adapter interpreter:
 
    ```text
    python -m pip install ./dcc_mcp_material_maker-<version>-py3-none-any.whl
    ```
 
-4. Run the read-only standard verification command with the exact application
-   path and release version:
+3. Plan managed activation. Replace the examples below with concrete absolute
+   paths before running them:
 
    ```text
-   dcc-mcp-material-maker verify --json --executable <ABSOLUTE_PATH> --material-maker-version <VERSION>
+   dcc-mcp-material-maker install --json --install-root ABSOLUTE_MANAGED_ROOT --executable ABSOLUTE_MATERIAL_MAKER --material-maker-version 1.7.0 --probe-project ABSOLUTE_PROBE_PROJECT.ptex
    ```
 
-5. Continue only when the JSON result has `exit_code: 0` and
-   `directly_usable: true`. Execute remediation from `next_steps[].command` as
-   an argument vector, substitute only the named placeholder, and then rerun
-   verify.
+4. Review the schema-valid result and execute only its exact
+   `next_steps[].command` argument vector. The emitted vector contains no
+   placeholders or shell-sensitive version expressions.
+5. Require `status: ok`, `exit_code: 0`, and
+   `verify.directly_usable: true` after execution.
 
-The reported endpoint has `kind: native_cli`: it is the exact Material Maker
-executable, not a network API. The DCC-MCP service itself uses normal Core
-standalone discovery after `dcc-mcp-material-maker` starts.
+Mutating commands are plan-first: omitting `--execute` performs no persistent
+writes. The deprecated `dcc-mcp-material-maker-install` alias remains a
+verification-only doctor alias and never activates or removes managed state.
 
 ## Manual path
 
@@ -91,8 +89,7 @@ macOS or Linux:
 sha256sum ./dcc_mcp_material_maker-<version>-py3-none-any.whl
 ```
 
-The result must exactly equal the digest published beside the immutable release
-artifact. Do not install on a mismatch.
+The result must exactly equal the publisher's immutable digest.
 
 ### 2. Install the wheel
 
@@ -100,129 +97,144 @@ artifact. Do not install on a mismatch.
 python -m pip install ./dcc_mcp_material_maker-<version>-py3-none-any.whl
 ```
 
-An editable `pip install -e` checkout is a development workflow and is not a
-supported installation substitute.
+An editable checkout is a development workflow, not a release installation.
 
-### 3. Configure the runtime
+### 3. Plan and execute managed activation
 
-The verification CLI accepts configuration directly, which avoids persistent
-shell changes:
+`install` writes a deterministic `adapter.json` only inside the dedicated
+install root. Its receipt is:
 
 ```text
-dcc-mcp-material-maker doctor --json --executable <ABSOLUTE_PATH> --material-maker-version <VERSION>
+MANAGED_ROOT/.dcc-mcp/receipts/material-maker.json
 ```
 
-For a persistent deployment, configure these variables in the service
-supervisor or operator-owned environment:
+The receipt binds the resolved install root and records the byte count and
+SHA-256 for every adapter-owned file. Existing unowned, moved, copied,
+malformed, missing, or tampered state fails closed. A different configuration
+requires `upgrade`; `install` never replaces it implicitly.
 
-- `DCC_MCP_MATERIAL_MAKER_EXECUTABLE`: exact official executable path.
-- `DCC_MCP_MATERIAL_MAKER_VERSION`: installed Material Maker release version.
-- `DCC_MCP_MATERIAL_MAKER_ALLOWED_ROOTS`: platform-separated project and
-  export roots. Use semicolons on Windows and colons on macOS/Linux.
+After reviewing the plan, rerun the exact emitted command with `--execute`.
+Install and upgrade publish a complete staged state by atomic directory
+replacement. A publish failure restores the prior verified state.
 
-The deprecated `dcc-mcp-material-maker-install` alias performs the same
-read-only doctor operation. It never installs files, changes configuration, or
-writes persistent state. New automation must use
-`dcc-mcp-material-maker doctor --json` or
-`dcc-mcp-material-maker verify --json`.
+Optional environment inputs are:
+
+- `DCC_MCP_MATERIAL_MAKER_INSTALL_ROOT`
+- `DCC_MCP_MATERIAL_MAKER_EXECUTABLE`
+- `DCC_MCP_MATERIAL_MAKER_VERSION`
+- `DCC_MCP_MATERIAL_MAKER_PROBE_PROJECT`
+- `DCC_MCP_MATERIAL_MAKER_ALLOWED_ROOTS` for normal project/export tools
+
+Explicit command arguments take precedence over environment values and the
+managed receipt.
 
 ## Verify
 
-Run full verify after installation, configuration changes, Material Maker
-upgrades, or Core upgrades:
+`status` verifies only the receipt/root binding and every owned-file digest:
 
 ```text
-dcc-mcp-material-maker verify --json
+dcc-mcp-material-maker status --json --install-root ABSOLUTE_MANAGED_ROOT
 ```
 
-The JSON result reports the adapter and Core versions, Python runtime, native
-CLI endpoint source, allowed-root configuration, Material Maker 1.7 floor,
-bounded readiness probe, failure stage/reason, and executable next steps.
+`verify` additionally loads the configured `.ptex` through the official
+Material Maker CLI and performs a transient export next to that project. The
+temporary output is removed. Readiness requires validated nonempty export
+artifacts within the adapter's file-count and byte limits; process exit zero by
+itself is never readiness.
 
-Stable exit codes:
+```text
+dcc-mcp-material-maker verify --json --install-root ABSOLUTE_MANAGED_ROOT
+```
+
+`doctor` is the read-only compatibility spelling of `verify`. It can verify
+explicit arguments without a receipt, but it never writes managed state.
+
+Stable exits follow the shared Install SOP:
 
 | Exit | Meaning |
 | ---: | --- |
-| `0` | All prerequisites and the bounded native readiness probe passed. |
-| `10` | Preflight failed, such as a missing executable or unsupported Core. |
-| `40` | Verification failed, such as an unknown/old Material Maker version or rejected native probe. |
+| `0` | Plan completed, status passed, or verified operation succeeded. |
+| `10` | Preflight failed. |
+| `20` | Artifact acquisition failed; reserved because this adapter does not download. |
+| `30` | Managed-state transaction or receipt prerequisite failed. |
+| `40` | Receipt integrity or bounded host verification failed. |
+| `50` | Restart is required; reserved for shared compatibility. |
 
-`directly_usable: true` is emitted only with exit 0. A discovered executable
-alone is not readiness.
+All results include integer `schema_version: 1`, adapter/Core/DCC identity,
+`steps`, `receipt_path`, `verify`, and executable `next_steps`.
 
 ## Upgrade
 
-1. Obtain the desired immutable adapter wheel and its published SHA-256 digest.
-2. Verify the digest as described above.
-3. Upgrade from that exact local artifact:
+Supply the desired concrete configuration to `upgrade`, first without and
+then with `--execute`. Upgrade requires an intact existing receipt and uses
+the same staged replacement and rollback contract as install.
 
-   ```text
-   python -m pip install --upgrade ./dcc_mcp_material_maker-<version>-py3-none-any.whl
-   ```
+Wheel replacement remains a separate, digest-verified operation:
 
-4. If Material Maker is upgraded separately by the user or OS package manager,
-   update the configured release version and executable path.
-5. Run `dcc-mcp-material-maker verify --json` and require exit 0.
+```text
+python -m pip install --upgrade ./dcc_mcp_material_maker-<version>-py3-none-any.whl
+```
 
-There is no adapter-owned Material Maker cache to migrate or delete.
+Run `verify` after an adapter, Core, Material Maker, executable, or probe
+project change.
 
 ## Uninstall
 
-1. Stop any running `dcc-mcp-material-maker` service process through the
-   operator or service supervisor that started it.
-2. Remove the adapter wheel:
+Plan removal:
 
-   ```text
-   python -m pip uninstall dcc-mcp-material-maker
-   ```
+```text
+dcc-mcp-material-maker uninstall --json --install-root ABSOLUTE_MANAGED_ROOT
+```
 
-3. Remove the three `DCC_MCP_MATERIAL_MAKER_*` configuration variables above
-   from the operator-owned environment if they are no longer used.
+Execute only the exact returned command. Uninstall first verifies the receipt,
+root identity, complete owned-file set, byte counts, and SHA-256 values. It
+then atomically moves the dedicated root before removal and restores it if
+removal fails. It never removes Material Maker, projects, exports, an unrelated
+file, or an unverified root.
 
-Uninstalling this adapter does not uninstall Material Maker and does not remove
-user projects or exports. There is no adapter binary cache to clean.
+Remove the Python wheel separately through the interpreter that owns it:
+
+```text
+python -m pip uninstall dcc-mcp-material-maker
+```
 
 ## Troubleshooting
 
 ### `material_maker_not_found` / exit 10
 
-Pass `--executable` with the exact official application path or configure
-`DCC_MCP_MATERIAL_MAKER_EXECUTABLE`. The adapter does not download the
-application.
+Pass the exact official executable or configure its environment variable. The
+adapter does not download a replacement.
 
 ### `core_version_unsupported` / exit 10
 
-Use a supported `dcc-mcp-core>=0.19.38,<1.0.0` in the same interpreter as the
-adapter, then rerun verify. Do not change the interpreter implicitly.
+Use a supported Core release in the same interpreter. Do not silently change
+interpreters.
 
-### `material_maker_version_unknown` / exit 40
+### `material_maker_version_invalid` or `unsupported` / exit 40
 
-Read the product release from the trusted Material Maker package or package
-manager and pass `--material-maker-version`. Godot's engine version is not the
-Material Maker product version.
+Use the trusted canonical final `X.Y.Z` product release. Godot's engine
+version is not Material Maker's product version.
 
-### `material_maker_version_unsupported` / exit 40
+### `probe_project_required` / exit 40
 
-The reported product version is earlier than 1.7. Upgrade Material Maker
-through its user- or OS-managed installation path and rerun verify with the new
-version.
+Select a trusted bounded `.ptex` project that Material Maker can load and
+export without modifying the source. Do not replace this gate with an empty
+process launch, arbitrary script, or UI action.
+
+### `receipt_integrity_failed` or `receipt_root_mismatch`
+
+Do not reuse, relocate, or hand-edit a receipt. Restore the exact verified
+state or use a new dedicated install root. Tampered state is never replaced or
+removed automatically.
 
 ### `native_probe_failed` / exit 40
 
-Run the same executable manually using Material Maker's documented
-`--export-material` contract, confirm it can start headlessly, and inspect its
-own diagnostics. Check OS execution permission and application dependencies;
-do not fall back to UI automation or arbitrary scripts.
-
-### Wrong endpoint or configuration
-
-Inspect `endpoint`, `config`, and `runtime` in the doctor JSON. Command-line
-values take precedence over environment discovery. Confirm the Python
-interpreter and allowed roots belong to the intended deployment.
+Diagnose the same official executable and `.ptex` input. The JSON result
+exposes only a stable exception type, not host exception text or arbitrary
+process output.
 
 ### Wheel or catalog unavailable
 
-The wheel is not currently published to PyPI, and the Core catalog still needs
-an immutable `install:` block with URL and SHA-256. Until those external release
-steps are complete, use only an operator-provided, digest-verified wheel; do not
-claim that the public pip command is usable.
+The wheel is not published to PyPI and the Core catalog still needs an
+immutable install URL and SHA-256. Use only an operator-provided,
+digest-verified wheel until those release steps are complete.

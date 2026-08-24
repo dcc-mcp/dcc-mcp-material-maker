@@ -336,7 +336,12 @@ class MaterialMakerCli:
             "node_types": dict(sorted(node_types.items())),
         }
 
-    def status(self, probe: bool = True, timeout_secs: float = 60) -> dict[str, Any]:
+    def status(
+        self,
+        probe: bool = True,
+        timeout_secs: float = 60,
+        probe_project: Optional[str] = None,
+    ) -> dict[str, Any]:
         result: dict[str, Any] = {
             "ready": False,
             "executable": self.executable,
@@ -357,24 +362,26 @@ class MaterialMakerCli:
         if not self.executable:
             result["reason"] = "material_maker_not_found"
             return result
-        if probe:
-            with tempfile.TemporaryDirectory(prefix="dcc-mcp-material-maker-probe-") as directory:
-                run = self._run(
-                    ("--export-material", "--output-dir", directory),
-                    timeout_secs,
-                )
-            combined = "%s\n%s" % (run["stdout"], run["stderr"])
-            if run["returncode"] != 0 or "ERROR:" in combined:
-                raise MaterialMakerError("Material Maker CLI readiness probe failed")
-            result["engine"] = {
-                key: run[key]
-                for key in (
-                    "returncode",
-                    "duration_secs",
-                    "stdout_truncated",
-                    "stderr_truncated",
-                )
-            }
+        if not probe or not probe_project:
+            result["reason"] = "probe_project_required"
+            return result
+        project = self._project_path(probe_project)
+        with tempfile.TemporaryDirectory(
+            prefix=".dcc-mcp-material-maker-probe-", dir=str(project.parent)
+        ) as directory:
+            exported = self.export_material(
+                str(project),
+                str(Path(directory) / "export"),
+                target="Godot",
+                output_file="%f",
+                timeout_secs=timeout_secs,
+            )
+        result["engine"] = exported["engine"]
+        result["readiness_evidence"] = {
+            "probe_project_sha256": _sha256_file(project),
+            "output_file_count": exported["file_count"],
+            "output_bytes": exported["total_bytes"],
+        }
         result["ready"] = True
         result["version"] = os.environ.get("DCC_MCP_MATERIAL_MAKER_VERSION", "unknown")
         return result

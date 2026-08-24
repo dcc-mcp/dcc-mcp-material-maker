@@ -14,7 +14,7 @@ keywords = ["material-maker", "procedural-materials", "ptex", "mcp", "dcc", "aut
 dependencies = ["dcc-mcp-core>=0.19.38,<1.0.0"]
 
 [project.optional-dependencies]
-dev = ["build>=1.2", "pytest>=8", "ruff>=0.8", "twine>=7.0; python_version >= '3.10'"]
+dev = ["build>=1.2", "jsonschema>=4.17,<5", "pytest>=8", "ruff>=0.8", "twine>=7.0; python_version >= '3.10'"]
 
 [project.urls]
 Homepage = "https://github.com/dcc-mcp/dcc-mcp-material-maker"
@@ -31,7 +31,7 @@ material_maker = "dcc_mcp_material_maker:MaterialMakerMcpServer"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dcc_mcp_material_maker"]
-artifacts = ["src/dcc_mcp_material_maker/skills/**"]
+artifacts = ["src/dcc_mcp_material_maker/schemas/**", "src/dcc_mcp_material_maker/skills/**"]
 
 [tool.hatch.build.targets.sdist]
 include = ["src/dcc_mcp_material_maker", "docs", "tests", "README.md", "install.md", "LICENSE", "CHANGELOG.md", "tools"]

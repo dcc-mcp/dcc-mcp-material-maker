@@ -38,7 +38,7 @@ def test_standard_doctor_json_reports_missing_executable_as_preflight_failure(tm
     assert report["config"]["requested_executable"] == str(missing)
     assert report["runtime"]["python_executable"] == sys.executable
     assert report["core"]["minimum_version"] == "0.19.38"
-    assert report["host"]["minimum_version"] == "1.7"
+    assert report["host"]["minimum_version"] == "1.7.0"
 
 
 def test_verify_enforces_material_maker_1_7_floor(capsys):
@@ -50,7 +50,7 @@ def test_verify_enforces_material_maker_1_7_floor(capsys):
                 "--executable",
                 sys.executable,
                 "--material-maker-version",
-                "1.6",
+                "1.6.0",
             ]
         )
 
@@ -58,9 +58,9 @@ def test_verify_enforces_material_maker_1_7_floor(capsys):
     report = json.loads(capsys.readouterr().out)
     assert report["host"] == {
         "name": "Material Maker",
-        "version": "1.6",
+        "version": "1.6.0",
         "version_source": "command_line",
-        "minimum_version": "1.7",
+        "minimum_version": "1.7.0",
         "satisfies_minimum": False,
     }
     assert report["failure"] == {
@@ -74,16 +74,20 @@ def test_verify_enforces_material_maker_1_7_floor(capsys):
 def test_verify_success_reports_runtime_core_endpoint_and_config(monkeypatch, tmp_path, capsys):
     executable = tmp_path / "material_maker"
     executable.write_bytes(b"fixture")
+    probe_project = tmp_path / "probe.ptex"
+    probe_project.write_text('{"nodes": [], "connections": []}', encoding="utf-8")
 
     class ReadyMaterialMakerCli:
-        def __init__(self, executable=None):
+        def __init__(self, executable=None, allowed_roots=None):
             self.executable = executable
-            self.allowed_roots = (tmp_path,)
+            self.allowed_roots = tuple(allowed_roots or (tmp_path,))
 
-        def status(self):
+        def status(self, probe_project=None):
+            assert probe_project
             return {
                 "ready": True,
                 "engine": {"returncode": 0, "duration_secs": 0.01},
+                "readiness_evidence": {"output_file_count": 1, "output_bytes": 1},
             }
 
     monkeypatch.setattr(install, "MaterialMakerCli", ReadyMaterialMakerCli)
@@ -96,6 +100,8 @@ def test_verify_success_reports_runtime_core_endpoint_and_config(monkeypatch, tm
             str(executable),
             "--material-maker-version",
             "1.7.2",
+            "--probe-project",
+            str(probe_project),
         ]
     )
 
@@ -122,11 +128,11 @@ def test_doctor_rejects_unsupported_core_before_claiming_usable(monkeypatch, tmp
     executable.write_bytes(b"fixture")
 
     class ReadyMaterialMakerCli:
-        def __init__(self, executable=None):
+        def __init__(self, executable=None, allowed_roots=None):
             self.executable = executable
-            self.allowed_roots = (tmp_path,)
+            self.allowed_roots = tuple(allowed_roots or (tmp_path,))
 
-        def status(self):
+        def status(self, probe_project=None):
             return {"ready": True, "engine": {"returncode": 0}}
 
     monkeypatch.setattr(install, "MaterialMakerCli", ReadyMaterialMakerCli)
@@ -140,7 +146,7 @@ def test_doctor_rejects_unsupported_core_before_claiming_usable(monkeypatch, tmp
                 "--executable",
                 str(executable),
                 "--material-maker-version",
-                "1.7",
+                "1.7.0",
             ]
         )
 
@@ -161,11 +167,11 @@ def test_verify_requires_explicit_product_version_when_native_cli_cannot_report_
     executable.write_bytes(b"fixture")
 
     class UnversionedMaterialMakerCli:
-        def __init__(self, executable=None):
+        def __init__(self, executable=None, allowed_roots=None):
             self.executable = executable
-            self.allowed_roots = (tmp_path,)
+            self.allowed_roots = tuple(allowed_roots or (tmp_path,))
 
-        def status(self):
+        def status(self, probe_project=None):
             raise AssertionError("version floor must be checked before the native readiness probe")
 
     monkeypatch.setattr(install, "MaterialMakerCli", UnversionedMaterialMakerCli)
@@ -189,13 +195,15 @@ def test_verify_requires_explicit_product_version_when_native_cli_cannot_report_
 def test_verify_converts_native_probe_error_to_stable_verify_failure(monkeypatch, tmp_path, capsys):
     executable = tmp_path / "material_maker"
     executable.write_bytes(b"fixture")
+    probe_project = tmp_path / "probe.ptex"
+    probe_project.write_text('{"nodes": [], "connections": []}', encoding="utf-8")
 
     class FailingMaterialMakerCli:
-        def __init__(self, executable=None):
+        def __init__(self, executable=None, allowed_roots=None):
             self.executable = executable
-            self.allowed_roots = (tmp_path,)
+            self.allowed_roots = tuple(allowed_roots or (tmp_path,))
 
-        def status(self):
+        def status(self, probe_project=None):
             raise MaterialMakerError("Material Maker CLI readiness probe failed")
 
     monkeypatch.setattr(install, "MaterialMakerCli", FailingMaterialMakerCli)
@@ -208,7 +216,9 @@ def test_verify_converts_native_probe_error_to_stable_verify_failure(monkeypatch
                 "--executable",
                 str(executable),
                 "--material-maker-version",
-                "1.7",
+                "1.7.0",
+                "--probe-project",
+                str(probe_project),
             ]
         )
 
@@ -218,20 +228,22 @@ def test_verify_converts_native_probe_error_to_stable_verify_failure(monkeypatch
     assert report["failure"] == {
         "stage": "verify",
         "reason": "native_probe_failed",
-        "detail": "Material Maker CLI readiness probe failed",
+        "detail": "MaterialMakerError",
     }
 
 
 def test_legacy_install_alias_is_deprecated_read_only_doctor(monkeypatch, tmp_path, capsys):
     executable = tmp_path / "material_maker"
     executable.write_bytes(b"fixture")
+    probe_project = tmp_path / "probe.ptex"
+    probe_project.write_text('{"nodes": [], "connections": []}', encoding="utf-8")
 
     class ReadyMaterialMakerCli:
-        def __init__(self, executable=None):
+        def __init__(self, executable=None, allowed_roots=None):
             self.executable = executable
-            self.allowed_roots = (tmp_path,)
+            self.allowed_roots = tuple(allowed_roots or (tmp_path,))
 
-        def status(self):
+        def status(self, probe_project=None):
             return {"ready": True, "engine": {"returncode": 0}}
 
     monkeypatch.setattr(install, "MaterialMakerCli", ReadyMaterialMakerCli)
@@ -244,7 +256,9 @@ def test_legacy_install_alias_is_deprecated_read_only_doctor(monkeypatch, tmp_pa
             "--executable",
             str(executable),
             "--material-maker-version",
-            "1.7",
+            "1.7.0",
+            "--probe-project",
+            str(probe_project),
         ],
     )
 

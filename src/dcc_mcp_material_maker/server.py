@@ -114,7 +114,7 @@ def stop_server() -> None:
 
 def main(argv: Optional[list[str]] = None) -> None:
     args = list(sys.argv[1:] if argv is None else argv)
-    if args and args[0] in {"doctor", "verify"}:
+    if args and args[0] in {"install", "status", "verify", "uninstall", "upgrade", "doctor"}:
         from .install import main as diagnostic_main
 
         diagnostic_main(args, program="dcc-mcp-material-maker")

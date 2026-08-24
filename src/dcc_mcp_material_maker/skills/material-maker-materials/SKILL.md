@@ -6,7 +6,7 @@ description: >-
   for Blender, Godot, Unity, or Unreal pipelines. Do not use for interactive
   Material Maker GUI control or arbitrary shader execution.
 license: MIT
-compatibility: "Python 3.9+; Material Maker 1.7; dcc-mcp-core 0.19+"
+compatibility: "Python 3.9+; Material Maker 1.7.0+; dcc-mcp-core 0.19.38+"
 allowed-tools: "python"
 metadata:
   dcc-mcp:
@@ -24,6 +24,10 @@ Use this Skill for deterministic `.ptex` inspection, structural validation, and
 native material export. The adapter runs as a standalone service and calls
 Material Maker's documented `--export-material` interface. It accepts typed
 data only and never evaluates caller-provided GDScript, GLSL, or shell input.
+
+Call `get_status` with a trusted `probe_project`. Readiness requires loading
+that bounded `.ptex` and producing nonempty transient export artifacts; an
+executable path or process exit zero alone is insufficient.
 
 Keep projects and export destinations under
 `DCC_MCP_MATERIAL_MAKER_ALLOWED_ROOTS`. Export to a new directory, inspect the
