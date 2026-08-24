@@ -50,7 +50,15 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=("install", "status", "verify", "uninstall", "upgrade", "doctor"),
+        choices=(
+            "install",
+            "status",
+            "verify",
+            "uninstall",
+            "upgrade",
+            "doctor",
+            "configure",
+        ),
         nargs="?",
         default="doctor",
     )
@@ -167,6 +175,40 @@ def _next_command(
     identifier: str, description: str, why: str, command: list[str]
 ) -> dict[str, Any]:
     return {"id": identifier, "description": description, "why": why, "command": command}
+
+
+def _collect_operator_configuration(report: dict[str, Any], args: argparse.Namespace) -> None:
+    """Collect only the two non-discoverable, non-secret readiness inputs."""
+    parsed = _version_tuple(args.material_maker_version)
+    if not parsed or parsed < _version_tuple(MIN_MATERIAL_MAKER_VERSION):
+        print(
+            "Enter the trusted canonical Material Maker product release (X.Y.Z):",
+            file=sys.stderr,
+        )
+        try:
+            selected_version = input("").strip()
+        except (EOFError, KeyboardInterrupt):
+            _fail(report, EXIT_VERIFY, "verify", "operator_configuration_cancelled")
+            return
+        parsed = _version_tuple(selected_version)
+        if not parsed or parsed < _version_tuple(MIN_MATERIAL_MAKER_VERSION):
+            _fail(report, EXIT_VERIFY, "verify", "material_maker_version_invalid")
+            return
+        args.material_maker_version = selected_version
+
+    probe = Path(args.probe_project).expanduser().resolve() if args.probe_project else None
+    if probe is None or probe.suffix.lower() != ".ptex" or not probe.is_file():
+        print("Enter the exact trusted .ptex readiness project path:", file=sys.stderr)
+        try:
+            selected_probe = input("").strip()
+        except (EOFError, KeyboardInterrupt):
+            _fail(report, EXIT_VERIFY, "verify", "operator_configuration_cancelled")
+            return
+        probe = Path(selected_probe).expanduser().resolve() if selected_probe else None
+        if probe is None or probe.suffix.lower() != ".ptex" or not probe.is_file():
+            _fail(report, EXIT_VERIFY, "verify", "probe_project_required")
+            return
+        args.probe_project = str(probe)
 
 
 def _base_report(args: argparse.Namespace, root: Path, program: Optional[str]) -> dict[str, Any]:
@@ -405,7 +447,10 @@ def _remove_state(root: Path) -> None:
                 os.replace(backup, root)
             raise
     finally:
-        if backup.exists() and root.exists():
+        # A successful delete leaves neither the managed root nor quarantine,
+        # so its safety copy is no longer needed.  Keep the copy only when a
+        # failed restore left no root and a partial quarantine still exists.
+        if backup.exists() and (root.exists() or not quarantine.exists()):
             shutil.rmtree(backup)
 
 
@@ -530,7 +575,7 @@ def _preflight_config(
                     "Retry with a trusted canonical final Material Maker release.",
                     "The native CLI cannot report the Material Maker product version.",
                     _command_for(
-                        args.command,
+                        "configure",
                         root,
                         executable=cli.executable,
                         probe_project=config.get("probe_project"),
@@ -551,7 +596,7 @@ def _preflight_config(
                     "Create or select a trusted bounded .ptex readiness project.",
                     "Exit zero without Material Maker-specific project evidence is not readiness.",
                     _command_for(
-                        args.command,
+                        "configure",
                         root,
                         executable=cli.executable,
                         host_version=str(version),
@@ -787,7 +832,9 @@ def main(argv: Optional[Sequence[str]] = None, *, program: Optional[str] = None)
         _fail(report, EXIT_PREFLIGHT, "preflight", exc.reason)
         return
     report = _base_report(args, root, program)
-    if args.command in {"doctor", "verify", "status"}:
+    if args.command == "configure":
+        _collect_operator_configuration(report, args)
+    if args.command in {"doctor", "verify", "status", "configure"}:
         _run_read_only(report, args, root)
     elif args.command in {"install", "upgrade"}:
         _run_install(report, args, root)

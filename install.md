@@ -213,13 +213,17 @@ interpreters.
 ### `material_maker_version_invalid` or `unsupported` / exit 40
 
 Use the trusted canonical final `X.Y.Z` product release. Godot's engine
-version is not Material Maker's product version.
+version is not Material Maker's product version. The emitted `configure`
+command prompts on stderr for that non-secret operator attestation and then
+immediately reruns the bounded readiness check; it never invents a release.
 
 ### `probe_project_required` / exit 40
 
 Select a trusted bounded `.ptex` project that Material Maker can load and
 export without modifying the source. Do not replace this gate with an empty
-process launch, arbitrary script, or UI action.
+process launch, arbitrary script, or UI action. The emitted `configure`
+command collects the exact path and then advances directly to the native
+readiness export without persisting an unverified placeholder.
 
 ### `receipt_integrity_failed` or `receipt_root_mismatch`
 
