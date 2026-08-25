@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -242,7 +243,7 @@ def test_install_plan_then_execute_creates_bound_receipt_with_all_owned_hashes(
     assert code == 0
     assert plan["status"] == "planned"
     assert not root.exists()
-    assert plan["next_steps"][0]["command"][-1] == "--execute"
+    assert plan["next_steps"][0]["command"][-1] == "--yes"
 
     code, result = _invoke(_install_args(root, executable, project, "--execute"), capsys)
     assert code == 0
@@ -256,6 +257,102 @@ def test_install_plan_then_execute_creates_bound_receipt_with_all_owned_hashes(
         assert owned.is_file()
         assert item["bytes"] == owned.stat().st_size
         assert item["sha256"] == install._sha256_file(owned)
+
+
+def test_standard_flags_plan_and_execute_with_explicit_runtime_owners(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setattr(install, "MaterialMakerCli", ReadyCli)
+    root = tmp_path / "managed-standard"
+    executable = tmp_path / "material_maker"
+    executable.write_bytes(b"host")
+    project = _project(tmp_path / "standard-probe.ptex")
+    args = [
+        "install",
+        "--json",
+        "--dry-run",
+        "--install-root",
+        str(root),
+        "--dcc-path",
+        str(executable),
+        "--python",
+        sys.executable,
+        "--material-maker-version",
+        "1.7.0",
+        "--probe-project",
+        str(project),
+    ]
+
+    code, plan = _invoke(args, capsys)
+
+    assert code == install.EXIT_OK
+    assert plan["status"] == "planned"
+    assert not root.exists()
+    assert plan["config"]["requested_python"] == str(Path(sys.executable).resolve())
+    assert plan["next_steps"][0]["command"][-1] == "--yes"
+
+    args.remove("--dry-run")
+    args.append("--yes")
+    code, result = _invoke(args, capsys)
+
+    assert code == install.EXIT_OK
+    assert result["status"] == "ok"
+    assert root.is_dir()
+
+
+def test_json_invalid_arguments_are_schema_valid_without_raw_argparse_stderr(tmp_path, capsys):
+    with pytest.raises(SystemExit) as raised:
+        server.main(
+            [
+                "install",
+                "--json",
+                "--yes",
+                "--dry-run",
+                "--install-root",
+                str(tmp_path / "managed"),
+            ]
+        )
+
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+    Draft202012Validator(_schema()).validate(report)
+    assert raised.value.code == install.EXIT_PREFLIGHT
+    assert report["exit_code"] == install.EXIT_PREFLIGHT
+    assert report["verify"]["failure_reason"] == "invalid_arguments"
+    assert captured.err == ""
+
+
+def test_explicit_python_owner_mismatch_fails_before_writing(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(install, "MaterialMakerCli", ReadyCli)
+    root = tmp_path / "managed"
+    executable = tmp_path / "material_maker"
+    executable.write_bytes(b"host")
+    other_python = tmp_path / "other-python"
+    other_python.write_bytes(b"not the owning interpreter")
+    project = _project(tmp_path / "probe.ptex")
+
+    code, report = _invoke(
+        [
+            "install",
+            "--json",
+            "--dry-run",
+            "--install-root",
+            str(root),
+            "--dcc-path",
+            str(executable),
+            "--python",
+            str(other_python),
+            "--material-maker-version",
+            "1.7.0",
+            "--probe-project",
+            str(project),
+        ],
+        capsys,
+    )
+
+    assert code == install.EXIT_PREFLIGHT
+    assert report["verify"]["failure_reason"] == "python_owner_mismatch"
+    assert not root.exists()
 
 
 def test_verify_rejects_tamper_and_receipt_reuse(monkeypatch, tmp_path, capsys):
@@ -361,7 +458,7 @@ def test_uninstall_is_plan_first_and_removes_only_verified_managed_root(
     assert code == 0
     assert plan["status"] == "planned"
     assert root.exists()
-    assert plan["next_steps"][0]["command"][-1] == "--execute"
+    assert plan["next_steps"][0]["command"][-1] == "--yes"
 
     code, result = _invoke(
         ["uninstall", "--json", "--install-root", str(root), "--execute"], capsys

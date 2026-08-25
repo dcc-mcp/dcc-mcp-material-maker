@@ -1,12 +1,136 @@
 from __future__ import annotations
 
+import concurrent.futures
+import ctypes
 import json
+import os
+import select
+import signal
 import sys
+import threading
+import time
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
-from dcc_mcp_material_maker.bridge import MaterialMakerCli, MaterialMakerError
+from dcc_mcp_material_maker import bridge
+from dcc_mcp_material_maker.bridge import (
+    MaterialMakerCli,
+    MaterialMakerError,
+    MaterialMakerTimeoutError,
+)
+
+PROCESS_TREE_HELPER = Path(__file__).with_name("process_tree_helper.py")
+
+
+class _ProcessIdentity:
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.handle: Optional[int] = None
+        self.pidfd: Optional[int] = None
+        if os.name == "nt":
+            synchronize_and_terminate = 0x00100001
+            handle = ctypes.windll.kernel32.OpenProcess(synchronize_and_terminate, False, pid)
+            if not handle:
+                raise OSError("failed to bind process identity")
+            self.handle = int(handle)
+        elif hasattr(os, "pidfd_open"):
+            self.pidfd = os.pidfd_open(pid)
+
+    def wait_dead(self, timeout_secs: float = 5.0) -> bool:
+        if self.handle is not None:
+            wait_object_0 = 0
+            result = ctypes.windll.kernel32.WaitForSingleObject(
+                self.handle, int(timeout_secs * 1000)
+            )
+            return result == wait_object_0
+        if self.pidfd is not None:
+            readable, _, _ = select.select([self.pidfd], [], [], timeout_secs)
+            return bool(readable)
+        deadline = time.monotonic() + timeout_secs
+        while time.monotonic() < deadline:
+            try:
+                os.kill(self.pid, 0)
+            except ProcessLookupError:
+                return True
+            time.sleep(0.05)
+        return False
+
+    def force_kill(self) -> None:
+        if self.handle is not None:
+            ctypes.windll.kernel32.TerminateProcess(self.handle, 91)
+            return
+        if self.pidfd is not None and hasattr(signal, "pidfd_send_signal"):
+            signal.pidfd_send_signal(self.pidfd, signal.SIGKILL)
+            return
+        try:
+            os.kill(self.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def close(self) -> None:
+        if self.handle is not None:
+            ctypes.windll.kernel32.CloseHandle(self.handle)
+        if self.pidfd is not None:
+            os.close(self.pidfd)
+
+
+def _wait_for_ready(future, ready_path: Path, timeout_secs: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout_secs
+    while time.monotonic() < deadline:
+        if ready_path.is_file():
+            return
+        if future.done():
+            future.result()
+        time.sleep(0.01)
+    raise AssertionError("process-tree helper did not become ready")
+
+
+def _bound_tree(root_pid_path: Path, descendant_pid_path: Path) -> list[_ProcessIdentity]:
+    return [
+        _ProcessIdentity(int(root_pid_path.read_text(encoding="ascii"))),
+        _ProcessIdentity(int(descendant_pid_path.read_text(encoding="ascii"))),
+    ]
+
+
+def _assert_tree_dead(identities: list[_ProcessIdentity]) -> None:
+    dead = [False] * len(identities)
+    try:
+        for index, identity in enumerate(identities):
+            dead[index] = identity.wait_dead()
+        assert all(dead)
+    finally:
+        for identity, is_dead in zip(identities, dead):
+            if not is_dead:
+                identity.force_kill()
+            identity.close()
+
+
+def _tree_command(tmp_path: Path) -> tuple[list[str], Path, Path, Path]:
+    root_pid = tmp_path / "root.pid"
+    descendant_pid = tmp_path / "descendant.pid"
+    ready = tmp_path / "descendant.ready"
+    return (
+        [
+            sys.executable,
+            str(PROCESS_TREE_HELPER),
+            str(root_pid),
+            str(descendant_pid),
+            str(ready),
+        ],
+        root_pid,
+        descendant_pid,
+        ready,
+    )
+
+
+def _root_exit_tree_command(tmp_path: Path) -> tuple[list[str], Path, Path, Path, Path]:
+    command, root_pid, descendant_pid, ready = _tree_command(tmp_path)
+    release = tmp_path / "root-exit.release"
+    command.insert(2, "root-exits")
+    command.append(str(release))
+    return command, root_pid, descendant_pid, ready, release
 
 
 def project_data() -> dict:
@@ -271,3 +395,83 @@ def test_timeout_must_stay_inside_configured_bound(tmp_path):
     cli.max_timeout_secs = 10
     with pytest.raises(MaterialMakerError, match="no more than 10"):
         cli._timeout(11)
+
+
+def test_posix_owner_never_signals_a_reused_group_after_its_leader_exits(monkeypatch):
+    class ReapedLeader:
+        pid = 424_242
+
+        @staticmethod
+        def poll():
+            return 0
+
+    signalled = []
+    monkeypatch.setattr(signal, "SIGKILL", 9, raising=False)
+    monkeypatch.setattr(signal, "SIGTERM", 15, raising=False)
+    monkeypatch.setattr(
+        os,
+        "killpg",
+        lambda process_group, requested_signal: signalled.append((process_group, requested_signal)),
+        raising=False,
+    )
+
+    owner = bridge._PosixProcessGroup(ReapedLeader())
+    owner.terminate(force=True)
+
+    assert signalled == []
+
+
+def test_timeout_terminates_root_and_ready_descendant_with_inherited_pipes(tmp_path):
+    cli = MaterialMakerCli(executable=sys.executable, allowed_roots=[tmp_path])
+    command, root_pid, descendant_pid, ready = _tree_command(tmp_path)
+    started = time.monotonic()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(cli._run_process, command, 5.0)
+        _wait_for_ready(future, ready)
+        identities = _bound_tree(root_pid, descendant_pid)
+        with pytest.raises(MaterialMakerTimeoutError, match="exceeded"):
+            future.result(timeout=10)
+
+    assert time.monotonic() - started < 11
+    _assert_tree_dead(identities)
+
+
+def test_cancellation_terminates_root_and_ready_descendant_without_orphans(monkeypatch, tmp_path):
+    class RequestedCancellation(RuntimeError):
+        pass
+
+    cancelled = threading.Event()
+
+    def check_cancelled():
+        if cancelled.is_set():
+            raise RequestedCancellation("cancelled")
+
+    monkeypatch.setattr(bridge, "check_dcc_cancelled", check_cancelled)
+    cli = MaterialMakerCli(executable=sys.executable, allowed_roots=[tmp_path])
+    command, root_pid, descendant_pid, ready = _tree_command(tmp_path)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(cli._run_process, command, 10.0)
+        _wait_for_ready(future, ready)
+        identities = _bound_tree(root_pid, descendant_pid)
+        cancelled.set()
+        with pytest.raises(RequestedCancellation, match="cancelled"):
+            future.result(timeout=6)
+
+    _assert_tree_dead(identities)
+
+
+def test_completed_root_cannot_release_group_identity_before_descendant_cleanup(tmp_path):
+    cli = MaterialMakerCli(executable=sys.executable, allowed_roots=[tmp_path])
+    command, root_pid, descendant_pid, ready, release = _root_exit_tree_command(tmp_path)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(cli._run_process, command, 5.0)
+        _wait_for_ready(future, ready)
+        identities = _bound_tree(root_pid, descendant_pid)
+        release.write_text("exit", encoding="ascii")
+        result = future.result(timeout=6)
+
+    assert result["returncode"] == 0
+    _assert_tree_dead(identities)

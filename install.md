@@ -59,7 +59,7 @@ the exact public loader and resource; the adapter carries no fallback copy.
    paths before running them:
 
    ```text
-   dcc-mcp-material-maker install --json --install-root ABSOLUTE_MANAGED_ROOT --executable ABSOLUTE_MATERIAL_MAKER --material-maker-version 1.7.0 --probe-project ABSOLUTE_PROBE_PROJECT.ptex
+   dcc-mcp-material-maker install --json --dry-run --install-root ABSOLUTE_MANAGED_ROOT --dcc-path ABSOLUTE_MATERIAL_MAKER --python ABSOLUTE_ADAPTER_PYTHON --material-maker-version 1.7.0 --probe-project ABSOLUTE_PROBE_PROJECT.ptex
    ```
 
 4. Review the schema-valid result and execute only its exact
@@ -68,8 +68,13 @@ the exact public loader and resource; the adapter carries no fallback copy.
 5. Require `status: ok`, `exit_code: 0`, and
    `verify.directly_usable: true` after execution.
 
-Mutating commands are plan-first: omitting `--execute` performs no persistent
-writes. The deprecated `dcc-mcp-material-maker-install` alias remains a
+Mutating commands are plan-first: `--dry-run` makes that intent explicit and
+`--yes` applies the reviewed plan. The existing `--execute` spelling remains
+a compatible alias for `--yes`; combining execution with `--dry-run` fails as
+schema-valid JSON. `--dcc-path` is the standard spelling for the host executable
+and `--executable` remains compatible. `--python` must resolve to the interpreter
+that owns the installed wheel, so the CLI never silently changes runtimes. The
+deprecated `dcc-mcp-material-maker-install` alias remains a
 verification-only doctor alias and never activates or removes managed state.
 
 ## Manual path
@@ -112,7 +117,7 @@ SHA-256 for every adapter-owned file. Existing unowned, moved, copied,
 malformed, missing, or tampered state fails closed. A different configuration
 requires `upgrade`; `install` never replaces it implicitly.
 
-After reviewing the plan, rerun the exact emitted command with `--execute`.
+After reviewing the plan, run the exact emitted command ending in `--yes`.
 Install and upgrade publish a complete staged state by atomic directory
 replacement. A publish failure restores the prior verified state.
 
@@ -164,8 +169,9 @@ All results include integer `schema_version: 1`, adapter/Core/DCC identity,
 
 ## Upgrade
 
-Supply the desired concrete configuration to `upgrade`, first without and
-then with `--execute`. Upgrade requires an intact existing receipt and uses
+Supply the desired concrete configuration to `upgrade`, first with `--dry-run`
+and then with `--yes`. The compatible `--execute` alias remains accepted.
+Upgrade requires an intact existing receipt and uses
 the same staged replacement and rollback contract as install.
 
 Wheel replacement remains a separate, digest-verified operation:
@@ -182,7 +188,7 @@ project change.
 Plan removal:
 
 ```text
-dcc-mcp-material-maker uninstall --json --install-root ABSOLUTE_MANAGED_ROOT
+dcc-mcp-material-maker uninstall --json --dry-run --install-root ABSOLUTE_MANAGED_ROOT --python ABSOLUTE_ADAPTER_PYTHON
 ```
 
 Execute only the exact returned command. Uninstall first verifies the receipt,
@@ -241,3 +247,6 @@ process output.
 The wheel is not published to PyPI and the Core catalog still needs an
 immutable install URL and SHA-256. Use only an operator-provided,
 digest-verified wheel until those release steps are complete.
+
+Real Material Maker acceptance remains unverified: CI uses deterministic
+native process helpers and synthetic `.ptex` fixtures, not the licensed host.

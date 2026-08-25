@@ -51,7 +51,7 @@ export DCC_MCP_MATERIAL_MAKER_EXECUTABLE=/opt/material-maker/material_maker
 export DCC_MCP_MATERIAL_MAKER_VERSION=1.7.0
 export DCC_MCP_MATERIAL_MAKER_PROBE_PROJECT=/workspace/materials/readiness.ptex
 export DCC_MCP_MATERIAL_MAKER_ALLOWED_ROOTS=/workspace/materials
-dcc-mcp-material-maker install --json --install-root /workspace/dcc-mcp-material-maker
+dcc-mcp-material-maker install --json --dry-run --install-root /workspace/dcc-mcp-material-maker --dcc-path /opt/material-maker/material_maker --python /usr/bin/python3
 # Review the schema-valid plan, then execute its exact next_steps[].command.
 dcc-mcp-material-maker verify --json --install-root /workspace/dcc-mcp-material-maker
 dcc-mcp-material-maker
@@ -68,7 +68,8 @@ executable variable is omitted.
 - bounds project size, graph traversal, node/connection counts, export files,
   export bytes, runtime, and captured output;
 - invokes a fixed executable argument vector with `shell=False` semantics;
-- supports Core cancellation and terminates timed-out child processes;
+- supports Core cancellation and owns the complete native process tree with a
+  Windows Job Object or POSIX process group so timeout/cancel leaves no orphan;
 - exports into a private staging directory, rejects links and empty output,
   hashes every file, and atomically exposes only a complete new directory;
 - treats process exit zero without a validated `.ptex` and nonempty bounded
@@ -91,3 +92,6 @@ python -m twine check dist/*
 
 The native exporter follows the official Material Maker command-line interface:
 <https://rodzilla.itch.io/material-maker>.
+
+Real Material Maker acceptance remains unverified; automated tests use bounded
+native helpers and synthetic projects rather than the licensed host.

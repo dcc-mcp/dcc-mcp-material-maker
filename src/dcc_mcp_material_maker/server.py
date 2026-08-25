@@ -114,7 +114,7 @@ def stop_server() -> None:
 
 def main(argv: Optional[list[str]] = None) -> None:
     args = list(sys.argv[1:] if argv is None else argv)
-    if args and args[0] in {
+    lifecycle_commands = {
         "install",
         "status",
         "verify",
@@ -122,7 +122,9 @@ def main(argv: Optional[list[str]] = None) -> None:
         "upgrade",
         "doctor",
         "configure",
-    }:
+    }
+    lifecycle_flags = {"--json", "--yes", "--dry-run", "--execute", "--dcc-path", "--python"}
+    if args and (args[0] in lifecycle_commands or any(item in lifecycle_flags for item in args)):
         from .install import main as diagnostic_main
 
         diagnostic_main(args, program="dcc-mcp-material-maker")
