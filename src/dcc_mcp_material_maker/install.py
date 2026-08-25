@@ -46,8 +46,18 @@ class InstallStateError(RuntimeError):
         self.reason = reason
 
 
+class _ArgumentError(RuntimeError):
+    """An invocation failed before the stable Install SOP report existed."""
+
+
+class _SopArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        del message
+        raise _ArgumentError("invalid_arguments")
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = _SopArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
         choices=(
@@ -64,8 +74,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--json", action="store_true", help="Emit the Install SOP v1 JSON result")
     parser.add_argument("--execute", action="store_true", help="Apply a planned mutating operation")
+    parser.add_argument("--yes", action="store_true", help="Apply a reviewed mutating plan")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Emit a plan without persistent writes"
+    )
     parser.add_argument("--install-root", help="Dedicated adapter-managed state directory")
     parser.add_argument("--executable", help="Exact path to the official Material Maker executable")
+    parser.add_argument("--dcc-path", help="Standard alias for the Material Maker executable")
+    parser.add_argument("--python", help="Exact Python interpreter that owns this adapter wheel")
     parser.add_argument(
         "--material-maker-version",
         help="Trusted final Material Maker release in canonical X.Y.Z form",
@@ -75,6 +91,54 @@ def _parser() -> argparse.ArgumentParser:
         help="Existing bounded .ptex project used only for a transient readiness export",
     )
     return parser
+
+
+def _fallback_args(values: Sequence[str]) -> argparse.Namespace:
+    commands = {"install", "status", "verify", "uninstall", "upgrade", "doctor", "configure"}
+    command = values[0] if values and values[0] in commands else "doctor"
+    return argparse.Namespace(
+        command=command,
+        json="--json" in values,
+        execute=False,
+        yes=False,
+        dry_run=False,
+        install_root=None,
+        executable=None,
+        dcc_path=None,
+        python=None,
+        material_maker_version=None,
+        probe_project=None,
+    )
+
+
+def _same_path(first: Path, second: Path) -> bool:
+    try:
+        return first.samefile(second)
+    except OSError:
+        return os.path.normcase(str(first.resolve())) == os.path.normcase(str(second.resolve()))
+
+
+def _normalize_args(args: argparse.Namespace) -> None:
+    mutating = args.command in {"install", "upgrade", "uninstall"}
+    if args.dry_run and (args.yes or args.execute):
+        raise InstallStateError("invalid_arguments", "Dry-run and execution flags conflict")
+    if not mutating and (args.dry_run or args.yes or args.execute):
+        raise InstallStateError("invalid_arguments", "Mutation flags require a mutating command")
+    if args.dcc_path and args.executable:
+        if not _same_path(Path(args.dcc_path).expanduser(), Path(args.executable).expanduser()):
+            raise InstallStateError("dcc_path_conflict", "DCC path aliases disagree")
+    if args.dcc_path:
+        args.executable = args.dcc_path
+    owner = Path(args.python or sys.executable).expanduser().resolve()
+    current = Path(sys.executable).resolve()
+    if not owner.is_file():
+        raise InstallStateError("python_owner_unavailable", "Owning Python is unavailable")
+    if not _same_path(owner, current):
+        raise InstallStateError(
+            "python_owner_mismatch", "Owning Python does not match this process"
+        )
+    args.python = str(owner)
+    args.execute = bool(args.execute or args.yes)
 
 
 def _program_name(program: Optional[str]) -> str:
@@ -161,13 +225,14 @@ def _command_for(
         str(root),
     ]
     if executable:
-        result.extend(("--executable", executable))
+        result.extend(("--dcc-path", executable))
+    result.extend(("--python", str(Path(sys.executable).resolve())))
     if host_version:
         result.extend(("--material-maker-version", host_version))
     if probe_project:
         result.extend(("--probe-project", probe_project))
     if execute:
-        result.append("--execute")
+        result.append("--yes")
     return result
 
 
@@ -246,6 +311,7 @@ def _base_report(args: argparse.Namespace, root: Path, program: Optional[str]) -
         "config": {
             "install_root": str(root),
             "requested_executable": args.executable,
+            "requested_python": args.python,
             "version_variable": "DCC_MCP_MATERIAL_MAKER_VERSION",
             "executable_variable": "DCC_MCP_MATERIAL_MAKER_EXECUTABLE",
             "probe_project_variable": "DCC_MCP_MATERIAL_MAKER_PROBE_PROJECT",
@@ -823,7 +889,27 @@ def _run_uninstall(report: dict[str, Any], args: argparse.Namespace, root: Path)
 
 def main(argv: Optional[Sequence[str]] = None, *, program: Optional[str] = None) -> None:
     """Run a plan-first Install SOP lifecycle and emit exactly one JSON result."""
-    args = _parser().parse_args(list(argv) if argv is not None else None)
+    values = list(argv) if argv is not None else list(sys.argv[1:])
+    parser = _parser()
+    try:
+        args = parser.parse_args(values)
+    except _ArgumentError:
+        if "--json" not in values:
+            parser.print_usage(sys.stderr)
+            print("invalid Install SOP arguments", file=sys.stderr)
+            raise SystemExit(EXIT_PREFLIGHT) from None
+        args = _fallback_args(values)
+        root = _default_install_root()
+        report = _base_report(args, root, program)
+        _fail(report, EXIT_PREFLIGHT, "preflight", "invalid_arguments")
+        return
+    try:
+        _normalize_args(args)
+    except InstallStateError as exc:
+        root = _default_install_root()
+        report = _base_report(args, root, program)
+        _fail(report, EXIT_PREFLIGHT, "preflight", exc.reason)
+        return
     try:
         root = _install_root(args.install_root)
     except InstallStateError as exc:

@@ -28,7 +28,7 @@ def test_published_install_sop_core_floor_is_projected_everywhere():
     assert "dcc-mcp-core>={},<1.0.0".format(expected) in runbook.replace(" ", "")
     assert "dcc-mcp-core {}+".format(expected) in skill
     assert 'DCC_MCP_CORE_FLOOR: "{}"'.format(expected) in workflow
-    assert "dcc-mcp-core==${DCC_MCP_CORE_FLOOR}" in workflow
+    assert "dcc-mcp-core==${{ env.DCC_MCP_CORE_FLOOR }}" in workflow
 
 
 def test_standard_doctor_json_reports_missing_executable_as_preflight_failure(tmp_path, capsys):
@@ -333,6 +333,30 @@ def test_readme_routes_installation_to_runbook_without_dead_pypi_command():
 def test_ci_executes_installed_doctor_json_exit_contract():
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "python tools/doctor_smoke.py" in workflow
+
+
+def test_ci_executes_installed_wheel_sop_contract_on_windows_and_linux():
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    smoke = (ROOT / "tools" / "wheel_smoke.py").read_text(encoding="utf-8")
+
+    assert "os: [ubuntu-latest, windows-latest]" in workflow
+    assert "runs-on: ${{ matrix.os }}" in workflow
+    assert "python tools/wheel_smoke.py" in workflow
+    for flag in ("--yes", "--dry-run", "--dcc-path", "--python", "--execute"):
+        assert flag in smoke
+
+
+def test_runbook_documents_standard_flags_and_current_release_boundaries():
+    runbook = (ROOT / "install.md").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    for flag in ("--yes", "--dry-run", "--dcc-path", "--python", "--execute"):
+        assert flag in runbook
+    combined = (runbook + readme).lower()
+    assert "carried compatibility" not in combined
+    assert "core #2320" not in combined
+    assert "canonical resource published by `dcc-mcp-core` 0.20.14" in " ".join(runbook.split())
+    assert "real material maker acceptance remains unverified" in combined
 
 
 def test_source_distribution_includes_install_runbook():
