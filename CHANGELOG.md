@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.4.0](https://github.com/dcc-mcp/dcc-mcp-material-maker/compare/v0.3.1...v0.4.0) (2026-08-25)
+
+
+### Features
+
+* add Material Maker install verification ([3b7bbbd](https://github.com/dcc-mcp/dcc-mcp-material-maker/commit/3b7bbbd7f5eac87ff817cb8d5e95e1fbff6668d6))
+* complete material maker install sop ([3ae5174](https://github.com/dcc-mcp/dcc-mcp-material-maker/commit/3ae51747f5a2cc7c1c9840e3153e8cddf7c3e918))
+
+
+### Bug Fixes
+
+* complete Material Maker lifecycle remediation ([bf0ddba](https://github.com/dcc-mcp/dcc-mcp-material-maker/commit/bf0ddba26946ee96a46cf1d930b06a01e945d8a6))
+* harden Material Maker install lifecycle ([928e011](https://github.com/dcc-mcp/dcc-mcp-material-maker/commit/928e011e394395445016eb573a1bd14bd92960e1))
+* harden Material Maker lifecycle transactions ([27fb203](https://github.com/dcc-mcp/dcc-mcp-material-maker/commit/27fb2039cca147399ec9009a5477cbe355fc48ab))
+* use released install SOP schema ([53bf104](https://github.com/dcc-mcp/dcc-mcp-material-maker/commit/53bf10463fccb8dd56c8a73edf8b4df399992b31))
+
 ## [0.3.1](https://github.com/dcc-mcp/dcc-mcp-material-maker/compare/v0.3.0...v0.3.1) (2026-08-13)
 
 

@@ -12,7 +12,7 @@ metadata:
   dcc-mcp:
     dcc: material_maker
     layer: domain
-    version: "0.3.1"  # x-release-please-version
+    version: "0.4.0"  # x-release-please-version
     search-hint: "Material Maker PTEX procedural material graph export Blender Godot Unity Unreal"
     tags: [material-maker, ptex, procedural-materials, game-dev, export]
     tools: tools.yaml
