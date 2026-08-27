@@ -19,6 +19,7 @@ from tools.release_guard import (
     GitHubReleaseClient,
     ReleaseContractError,
     capture_snapshot,
+    capture_staged_snapshot,
     create_manifest,
     verify_artifact_metadata,
     verify_manifest,
@@ -27,7 +28,7 @@ from tools.release_guard import (
     write_manifest,
 )
 from tools.release_guard import (
-    publish_assets_transactional as _publish_assets_transactional,
+    publish_assets_resumable as _publish_assets_resumable,
 )
 
 try:
@@ -84,6 +85,17 @@ def _release(**changes: object) -> dict[str, object]:
     return payload
 
 
+def _draft_release(**changes: object) -> dict[str, object]:
+    payload = _release(
+        draft=True,
+        published_at=None,
+        name=TAG,
+        body=f"<!-- dcc-mcp-release-owner:v1:{SHA} -->",
+    )
+    payload.update(changes)
+    return payload
+
+
 def _artifact_binding():
     return release_guard.ArtifactBinding(
         repository="dcc-mcp/dcc-mcp-material-maker",
@@ -131,7 +143,7 @@ class _ArtifactBoundClient:
         return getattr(self._target, name)
 
 
-def publish_assets_transactional(
+def publish_assets_resumable(
     snapshot,
     manifest,
     dist,
@@ -140,7 +152,7 @@ def publish_assets_transactional(
     artifact_binding=None,
 ) -> None:
     client = github if hasattr(github, "recapture_artifact") else _ArtifactBoundClient(github)
-    _publish_assets_transactional(
+    _publish_assets_resumable(
         snapshot,
         manifest,
         dist,
@@ -837,6 +849,50 @@ def test_archive_member_portability_and_topology_are_enforced_in_both_phases(
             verify_manifest(manifest_path, dist, manifest_sha256)
 
 
+@pytest.mark.parametrize("phase", ["create", "verify"])
+@pytest.mark.parametrize("kind", ["wheel", "sdist"])
+def test_archive_rejects_standalone_non_nfkc_member_names(tmp_path, phase: str, kind: str) -> None:
+    dist = _dist(tmp_path)
+    _append_archive_members(dist, kind, ["pkg/\uff26\uff2f\uff2f.txt"])
+
+    with pytest.raises(ReleaseContractError, match="distribution archive mismatch"):
+        if phase == "create":
+            create_manifest(dist, project=PROJECT, version=VERSION)
+        else:
+            manifest_path = tmp_path / "manifest.json"
+            manifest_sha256 = _write_current_dist_manifest(dist, manifest_path)
+            verify_manifest(manifest_path, dist, manifest_sha256)
+
+
+@pytest.mark.parametrize("phase", ["create", "verify"])
+def test_archive_rejects_raw_ustar_non_nfkc_member_names(tmp_path, phase: str) -> None:
+    dist = _dist(tmp_path)
+    sdist = dist / "dcc_mcp_material_maker-0.4.1.tar.gz"
+    root = "dcc_mcp_material_maker-0.4.1"
+    metadata = _metadata()
+    metadata_member = tarfile.TarInfo(f"{root}/PKG-INFO")
+    metadata_member.size = len(metadata)
+    unsafe = tarfile.TarInfo(f"{root}/pkg/\uff26\uff2f\uff2f.txt")
+    unsafe.size = len(b"unsafe")
+    with tarfile.open(
+        sdist,
+        "w:gz",
+        format=tarfile.USTAR_FORMAT,
+        encoding="utf-8",
+        errors="strict",
+    ) as archive:
+        archive.addfile(metadata_member, io.BytesIO(metadata))
+        archive.addfile(unsafe, io.BytesIO(b"unsafe"))
+
+    with pytest.raises(ReleaseContractError, match="distribution archive mismatch"):
+        if phase == "create":
+            create_manifest(dist, project=PROJECT, version=VERSION)
+        else:
+            manifest_path = tmp_path / "manifest.json"
+            manifest_sha256 = _write_current_dist_manifest(dist, manifest_path)
+            verify_manifest(manifest_path, dist, manifest_sha256)
+
+
 @pytest.mark.parametrize("kind", ["wheel", "sdist"])
 def test_archive_explicit_directory_with_child_is_valid(tmp_path, kind: str) -> None:
     dist = _dist(tmp_path)
@@ -1139,12 +1195,12 @@ def test_every_release_consumer_rejects_noncanonical_descriptor_metadata_before_
         assert "release guard failed: distribution archive mismatch" in capsys.readouterr().err
         return
 
-    snapshot = capture_snapshot(
+    snapshot = capture_staged_snapshot(
         repository="dcc-mcp/dcc-mcp-material-maker",
         tag=TAG,
         source_sha=SHA,
         ref_payload=_ref(),
-        release_payload=_release(),
+        release_payload=_draft_release(),
     )
 
     class NoGitHubMutation:
@@ -1155,7 +1211,7 @@ def test_every_release_consumer_rejects_noncanonical_descriptor_metadata_before_
             raise AssertionError(f"GitHub must not be called before archive validation: {name}")
 
     with pytest.raises(ReleaseContractError, match="distribution archive mismatch"):
-        publish_assets_transactional(
+        publish_assets_resumable(
             snapshot,
             _current_dist_manifest(dist),
             dist,
@@ -1170,12 +1226,12 @@ def test_asset_publisher_reuses_shared_descriptor_validator_before_github_mutati
     manifest = create_manifest(dist, project=PROJECT, version=VERSION)
     wheel = dist / "dcc_mcp_material_maker-0.4.1-py3-none-any.whl"
     _write_descriptor_wheel(wheel, "signed-crc")
-    snapshot = capture_snapshot(
+    snapshot = capture_staged_snapshot(
         repository="dcc-mcp/dcc-mcp-material-maker",
         tag=TAG,
         source_sha=SHA,
         ref_payload=_ref(),
-        release_payload=_release(),
+        release_payload=_draft_release(),
     )
 
     class NoGitHubMutation:
@@ -1186,7 +1242,7 @@ def test_asset_publisher_reuses_shared_descriptor_validator_before_github_mutati
             raise AssertionError(f"GitHub must not be called before archive validation: {name}")
 
     with pytest.raises(ReleaseContractError, match="distribution archive mismatch"):
-        publish_assets_transactional(snapshot, manifest, dist, NoGitHubMutation())
+        publish_assets_resumable(snapshot, manifest, dist, NoGitHubMutation())
 
 
 @pytest.mark.parametrize("phase", ["create", "verify"])
@@ -1592,761 +1648,6 @@ def test_sdist_explicitly_excludes_local_release_evidence() -> None:
     } <= excludes
 
 
-def test_asset_publication_rolls_back_if_identity_drifts_between_assets(tmp_path) -> None:
-    dist = _dist(tmp_path)
-    manifest = create_manifest(dist, project=PROJECT, version=VERSION)
-    snapshot = capture_snapshot(
-        repository="dcc-mcp/dcc-mcp-material-maker",
-        tag=TAG,
-        source_sha=SHA,
-        ref_payload=_ref(),
-        release_payload=_release(),
-    )
-
-    class FakeGitHub:
-        def __init__(self) -> None:
-            self.assets: list[dict[str, object]] = []
-            self.recaptures = 0
-            self.upload_release_ids: list[int] = []
-            self.deleted: list[tuple[int, int]] = []
-
-        def recapture_release(self, expected_snapshot):
-            assert expected_snapshot == snapshot
-            self.recaptures += 1
-            payload = _release(assets=copy.deepcopy(self.assets))
-            if self.recaptures == 3:
-                payload["published_at"] = "2026-08-27T00:00:02Z"
-            return _ref(), payload
-
-        def upload_asset(
-            self, release_id: int, path: Path, ownership_marker: str
-        ) -> dict[str, object]:
-            self.upload_release_ids.append(release_id)
-            asset = {
-                "id": len(self.assets) + 1,
-                "name": path.name,
-                "label": ownership_marker,
-                "size": path.stat().st_size,
-                "state": "uploaded",
-                "digest": f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}",
-            }
-            self.assets.append(asset)
-            return copy.deepcopy(asset)
-
-        def delete_asset(self, release_id: int, asset_id: int) -> None:
-            self.deleted.append((release_id, asset_id))
-            self.assets = [asset for asset in self.assets if asset["id"] != asset_id]
-
-    github = FakeGitHub()
-    with pytest.raises(ReleaseContractError, match="release state drift"):
-        publish_assets_transactional(snapshot, manifest, dist, github)
-
-    assert github.upload_release_ids == [snapshot.release_id]
-    assert github.deleted == [(snapshot.release_id, 1)]
-    assert github.assets == []
-
-
-def test_asset_rollback_retries_when_delete_did_not_reach_github(tmp_path) -> None:
-    dist = _dist(tmp_path)
-    manifest = create_manifest(dist, project=PROJECT, version=VERSION)
-    snapshot = capture_snapshot(
-        repository="dcc-mcp/dcc-mcp-material-maker",
-        tag=TAG,
-        source_sha=SHA,
-        ref_payload=_ref(),
-        release_payload=_release(),
-    )
-
-    class FakeGitHub:
-        def __init__(self) -> None:
-            self.assets: list[dict[str, object]] = []
-            self.recaptures = 0
-            self.delete_attempts = 0
-
-        def recapture_release(self, _snapshot):
-            self.recaptures += 1
-            payload = _release(assets=copy.deepcopy(self.assets))
-            if self.recaptures == 3:
-                payload["published_at"] = "2026-08-27T00:00:02Z"
-            return _ref(), payload
-
-        def upload_asset(
-            self, _release_id: int, path: Path, ownership_marker: str
-        ) -> dict[str, object]:
-            asset = {
-                "id": 1,
-                "name": path.name,
-                "label": ownership_marker,
-                "size": path.stat().st_size,
-                "state": "uploaded",
-                "digest": f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}",
-            }
-            self.assets.append(asset)
-            return copy.deepcopy(asset)
-
-        def delete_asset(self, _release_id: int, asset_id: int) -> None:
-            self.delete_attempts += 1
-            if self.delete_attempts < 3:
-                raise TimeoutError("DELETE did not reach GitHub")
-            self.assets = [asset for asset in self.assets if asset["id"] != asset_id]
-
-    github = FakeGitHub()
-    with pytest.raises(ReleaseContractError, match="release state drift"):
-        publish_assets_transactional(snapshot, manifest, dist, github)
-
-    assert github.delete_attempts == 3
-    assert github.assets == []
-
-
-def test_asset_rollback_retry_exhaustion_is_bounded_and_fail_closed(tmp_path) -> None:
-    dist = _dist(tmp_path)
-    manifest = create_manifest(dist, project=PROJECT, version=VERSION)
-    snapshot = capture_snapshot(
-        repository="dcc-mcp/dcc-mcp-material-maker",
-        tag=TAG,
-        source_sha=SHA,
-        ref_payload=_ref(),
-        release_payload=_release(),
-    )
-
-    class FakeGitHub:
-        def __init__(self) -> None:
-            self.assets: list[dict[str, object]] = []
-            self.recaptures = 0
-            self.delete_attempts = 0
-
-        def recapture_release(self, _snapshot):
-            self.recaptures += 1
-            payload = _release(assets=copy.deepcopy(self.assets))
-            if self.recaptures == 3:
-                payload["published_at"] = "2026-08-27T00:00:02Z"
-            return _ref(), payload
-
-        def upload_asset(
-            self, _release_id: int, path: Path, ownership_marker: str
-        ) -> dict[str, object]:
-            asset = {
-                "id": 1,
-                "name": path.name,
-                "label": ownership_marker,
-                "size": path.stat().st_size,
-                "state": "uploaded",
-                "digest": f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}",
-            }
-            self.assets.append(asset)
-            return copy.deepcopy(asset)
-
-        def delete_asset(self, _release_id: int, _asset_id: int) -> None:
-            self.delete_attempts += 1
-            raise TimeoutError("DELETE never reached GitHub")
-
-    github = FakeGitHub()
-    with pytest.raises(
-        ReleaseContractError, match="asset publication failed and rollback was incomplete"
-    ):
-        publish_assets_transactional(snapshot, manifest, dist, github)
-
-    assert github.delete_attempts == 3
-    assert [asset["id"] for asset in github.assets] == [1]
-
-
-def test_unvalidated_upload_response_never_enters_owned_rollback_state(tmp_path) -> None:
-    dist = _dist(tmp_path)
-    manifest = create_manifest(dist, project=PROJECT, version=VERSION)
-    snapshot = capture_snapshot(
-        repository="dcc-mcp/dcc-mcp-material-maker",
-        tag=TAG,
-        source_sha=SHA,
-        ref_payload=_ref(),
-        release_payload=_release(),
-    )
-
-    class FakeGitHub:
-        def __init__(self) -> None:
-            self.assets: list[dict[str, object]] = []
-            self.deleted: list[int] = []
-
-        def recapture_release(self, _snapshot):
-            return _ref(), _release(assets=copy.deepcopy(self.assets))
-
-        def upload_asset(self, _release_id: int, path: Path, _ownership_marker: str):
-            contender = {
-                "id": 7001,
-                "name": path.name,
-                "label": None,
-                "size": path.stat().st_size,
-                "state": "uploaded",
-                "digest": f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}",
-            }
-            self.assets.append(contender)
-            return copy.deepcopy(contender)
-
-        def delete_asset(self, _release_id: int, asset_id: int) -> None:
-            self.deleted.append(asset_id)
-            self.assets = [asset for asset in self.assets if asset["id"] != asset_id]
-
-    github = FakeGitHub()
-    with pytest.raises(ReleaseContractError, match="uploaded asset mismatch"):
-        publish_assets_transactional(snapshot, manifest, dist, github)
-
-    assert github.deleted == []
-    assert [asset["id"] for asset in github.assets] == [7001]
-
-
-def test_asset_publication_preserves_unvalidated_bad_digest_contender(tmp_path) -> None:
-    dist = _dist(tmp_path)
-    manifest = create_manifest(dist, project=PROJECT, version=VERSION)
-    snapshot = capture_snapshot(
-        repository="dcc-mcp/dcc-mcp-material-maker",
-        tag=TAG,
-        source_sha=SHA,
-        ref_payload=_ref(),
-        release_payload=_release(),
-    )
-
-    class FakeGitHub:
-        def __init__(self) -> None:
-            self.assets: list[dict[str, object]] = []
-            self.deleted: list[tuple[int, int]] = []
-
-        def recapture_release(self, expected_snapshot):
-            assert expected_snapshot == snapshot
-            return _ref(), _release(assets=copy.deepcopy(self.assets))
-
-        def upload_asset(
-            self, release_id: int, path: Path, ownership_marker: str
-        ) -> dict[str, object]:
-            assert release_id == snapshot.release_id
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            if self.assets:
-                digest = "0" * 64
-            asset = {
-                "id": len(self.assets) + 1,
-                "name": path.name,
-                "label": ownership_marker,
-                "size": path.stat().st_size,
-                "state": "uploaded",
-                "digest": f"sha256:{digest}",
-            }
-            self.assets.append(asset)
-            return copy.deepcopy(asset)
-
-        def delete_asset(self, release_id: int, asset_id: int) -> None:
-            self.deleted.append((release_id, asset_id))
-            self.assets = [asset for asset in self.assets if asset["id"] != asset_id]
-
-    github = FakeGitHub()
-    with pytest.raises(
-        ReleaseContractError, match="asset publication failed and rollback was incomplete"
-    ):
-        publish_assets_transactional(snapshot, manifest, dist, github)
-
-    assert github.deleted == [(snapshot.release_id, 1)]
-    assert [asset["id"] for asset in github.assets] == [2]
-
-
-def test_asset_conflict_preflight_finishes_before_first_mutation(tmp_path) -> None:
-    dist = _dist(tmp_path)
-    manifest = create_manifest(dist, project=PROJECT, version=VERSION)
-    snapshot = capture_snapshot(
-        repository="dcc-mcp/dcc-mcp-material-maker",
-        tag=TAG,
-        source_sha=SHA,
-        ref_payload=_ref(),
-        release_payload=_release(),
-    )
-    existing = {
-        "id": 99,
-        "name": manifest["artifacts"][0]["filename"],
-        "size": 1,
-        "state": "uploaded",
-        "digest": "sha256:" + "0" * 64,
-    }
-
-    class FakeGitHub:
-        mutations = 0
-
-        def recapture_release(self, _snapshot):
-            return _ref(), _release(assets=[existing])
-
-        def upload_asset(self, _release_id, _path, _ownership_marker):
-            self.mutations += 1
-            raise AssertionError("upload must not run")
-
-        def delete_asset(self, _release_id, _asset_id):
-            self.mutations += 1
-            raise AssertionError("delete must not run")
-
-    github = FakeGitHub()
-    with pytest.raises(ReleaseContractError, match="release assets must be empty"):
-        publish_assets_transactional(snapshot, manifest, dist, github)
-    assert github.mutations == 0
-
-
-def test_asset_publication_is_sequential_and_recaptures_before_each_post(tmp_path) -> None:
-    dist = _dist(tmp_path)
-    manifest = create_manifest(dist, project=PROJECT, version=VERSION)
-    snapshot = capture_snapshot(
-        repository="dcc-mcp/dcc-mcp-material-maker",
-        tag=TAG,
-        source_sha=SHA,
-        ref_payload=_ref(),
-        release_payload=_release(),
-    )
-
-    class FakeGitHub:
-        def __init__(self) -> None:
-            self.assets: list[dict[str, object]] = []
-            self.events: list[str] = []
-
-        def recapture_release(self, _snapshot):
-            self.events.append("recapture")
-            return _ref(), _release(assets=copy.deepcopy(self.assets))
-
-        def recapture_artifact(self, artifact_id: int):
-            assert artifact_id == ARTIFACT_ID
-            self.events.append("artifact")
-            return _artifact_metadata()
-
-        def upload_asset(
-            self, release_id: int, path: Path, ownership_marker: str
-        ) -> dict[str, object]:
-            assert release_id == snapshot.release_id
-            self.events.append(f"upload:{path.name}")
-            asset = {
-                "id": len(self.assets) + 1,
-                "name": path.name,
-                "label": ownership_marker,
-                "size": path.stat().st_size,
-                "state": "uploaded",
-                "digest": f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}",
-            }
-            self.assets.append(asset)
-            return copy.deepcopy(asset)
-
-        def delete_asset(self, _release_id, _asset_id):
-            raise AssertionError("successful publication must not roll back")
-
-    github = FakeGitHub()
-    publish_assets_transactional(
-        snapshot,
-        manifest,
-        dist,
-        github,
-        artifact_binding=_artifact_binding(),
-    )
-    assert github.events == [
-        "recapture",
-        "artifact",
-        "recapture",
-        "upload:dcc_mcp_material_maker-0.4.1-py3-none-any.whl",
-        "recapture",
-        "artifact",
-        "recapture",
-        "upload:dcc_mcp_material_maker-0.4.1.tar.gz",
-        "recapture",
-        "recapture",
-    ]
-
-
-def test_artifact_provenance_drift_before_next_post_rolls_back_only_owned_assets(
-    tmp_path,
-) -> None:
-    dist = _dist(tmp_path)
-    manifest = create_manifest(dist, project=PROJECT, version=VERSION)
-    snapshot = capture_snapshot(
-        repository="dcc-mcp/dcc-mcp-material-maker",
-        tag=TAG,
-        source_sha=SHA,
-        ref_payload=_ref(),
-        release_payload=_release(),
-    )
-
-    class FakeGitHub:
-        def __init__(self) -> None:
-            self.assets: list[dict[str, object]] = []
-            self.uploads = 0
-            self.artifact_recaptures = 0
-            self.deleted: list[int] = []
-
-        def recapture_artifact(self, artifact_id: int):
-            assert artifact_id == ARTIFACT_ID
-            self.artifact_recaptures += 1
-            metadata = _artifact_metadata()
-            if self.artifact_recaptures == 2:
-                metadata["digest"] = "sha256:" + "0" * 64
-            return metadata
-
-        def recapture_release(self, _snapshot):
-            return _ref(), _release(assets=copy.deepcopy(self.assets))
-
-        def upload_asset(self, _release_id: int, path: Path, ownership_marker: str):
-            self.uploads += 1
-            asset = {
-                "id": self.uploads,
-                "name": path.name,
-                "label": ownership_marker,
-                "size": path.stat().st_size,
-                "state": "uploaded",
-                "digest": f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}",
-            }
-            self.assets.append(asset)
-            return copy.deepcopy(asset)
-
-        def delete_asset(self, _release_id: int, asset_id: int) -> None:
-            self.deleted.append(asset_id)
-            self.assets = [asset for asset in self.assets if asset["id"] != asset_id]
-
-    github = FakeGitHub()
-    with pytest.raises(ReleaseContractError, match="artifact digest drift"):
-        publish_assets_transactional(snapshot, manifest, dist, github)
-
-    assert github.artifact_recaptures == 2
-    assert github.uploads == 1
-    assert github.deleted == [1]
-    assert github.assets == []
-
-
-def test_asset_publication_recovers_ambiguous_post_timeout_without_partial_assets(
-    tmp_path,
-) -> None:
-    dist = _dist(tmp_path)
-    manifest = create_manifest(dist, project=PROJECT, version=VERSION)
-    snapshot = capture_snapshot(
-        repository="dcc-mcp/dcc-mcp-material-maker",
-        tag=TAG,
-        source_sha=SHA,
-        ref_payload=_ref(),
-        release_payload=_release(),
-    )
-
-    class FakeGitHub:
-        def __init__(self) -> None:
-            self.assets: list[dict[str, object]] = []
-            self.deleted: list[int] = []
-
-        def recapture_release(self, _snapshot):
-            return _ref(), _release(assets=copy.deepcopy(self.assets))
-
-        def upload_asset(
-            self, _release_id: int, path: Path, ownership_marker: str
-        ) -> dict[str, object]:
-            asset = {
-                "id": len(self.assets) + 1,
-                "name": path.name,
-                "label": ownership_marker,
-                "size": path.stat().st_size,
-                "state": "uploaded",
-                "digest": f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}",
-            }
-            self.assets.append(asset)
-            if len(self.assets) == 2:
-                raise TimeoutError("response lost after server commit")
-            return copy.deepcopy(asset)
-
-        def delete_asset(self, _release_id: int, asset_id: int) -> None:
-            self.deleted.append(asset_id)
-            self.assets = [asset for asset in self.assets if asset["id"] != asset_id]
-
-    github = FakeGitHub()
-    with pytest.raises(ReleaseContractError, match="GitHub asset publication failed"):
-        publish_assets_transactional(snapshot, manifest, dist, github)
-    assert github.deleted == [2, 1]
-    assert github.assets == []
-
-
-def test_lost_post_response_preserves_all_same_marker_candidates_when_ambiguous(
-    tmp_path,
-) -> None:
-    dist = _dist(tmp_path)
-    manifest = create_manifest(dist, project=PROJECT, version=VERSION)
-    snapshot = capture_snapshot(
-        repository="dcc-mcp/dcc-mcp-material-maker",
-        tag=TAG,
-        source_sha=SHA,
-        ref_payload=_ref(),
-        release_payload=_release(),
-    )
-
-    class FakeGitHub:
-        def __init__(self) -> None:
-            self.assets: list[dict[str, object]] = []
-            self.deleted: list[int] = []
-            self.markers: list[str] = []
-
-        def recapture_release(self, _snapshot):
-            return _ref(), _release(assets=copy.deepcopy(self.assets))
-
-        def make_asset(self, path: Path, asset_id: int, marker: str | None) -> dict[str, object]:
-            return {
-                "id": asset_id,
-                "name": path.name,
-                "label": marker,
-                "size": path.stat().st_size,
-                "state": "uploaded",
-                "digest": f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}",
-            }
-
-        def upload_asset(
-            self, _release_id: int, path: Path, ownership_marker: str
-        ) -> dict[str, object]:
-            assert ownership_marker
-            self.markers.append(ownership_marker)
-            if not self.assets:
-                asset = self.make_asset(path, 1, ownership_marker)
-                self.assets.append(asset)
-                return copy.deepcopy(asset)
-            self.assets.extend(
-                [
-                    self.make_asset(path, 2, ownership_marker),
-                    self.make_asset(path, 99, ownership_marker),
-                    self.make_asset(path, 100, "another-transaction"),
-                ]
-            )
-            raise TimeoutError("POST response lost after multiple server commits")
-
-        def delete_asset(self, _release_id: int, asset_id: int) -> None:
-            self.deleted.append(asset_id)
-            self.assets = [asset for asset in self.assets if asset["id"] != asset_id]
-
-    github = FakeGitHub()
-    with pytest.raises(
-        ReleaseContractError, match="asset publication failed and rollback was incomplete"
-    ):
-        publish_assets_transactional(snapshot, manifest, dist, github)
-
-    assert len(github.markers) == 2
-    assert github.markers[0] != github.markers[1]
-    assert github.deleted == [1]
-    assert [asset["id"] for asset in github.assets] == [2, 99, 100]
-    assert set(github.deleted).isdisjoint({2, 99})
-
-
-def test_lost_post_response_preserves_exact_and_drifted_same_marker_candidates(
-    tmp_path,
-) -> None:
-    dist = _dist(tmp_path)
-    manifest = create_manifest(dist, project=PROJECT, version=VERSION)
-    snapshot = capture_snapshot(
-        repository="dcc-mcp/dcc-mcp-material-maker",
-        tag=TAG,
-        source_sha=SHA,
-        ref_payload=_ref(),
-        release_payload=_release(),
-    )
-
-    class FakeGitHub:
-        def __init__(self) -> None:
-            self.assets: list[dict[str, object]] = []
-            self.deleted: list[int] = []
-
-        def recapture_release(self, _snapshot):
-            return _ref(), _release(assets=copy.deepcopy(self.assets))
-
-        def make_asset(self, path: Path, asset_id: int, ownership_marker: str) -> dict[str, object]:
-            return {
-                "id": asset_id,
-                "name": path.name,
-                "label": ownership_marker,
-                "size": path.stat().st_size,
-                "state": "uploaded",
-                "digest": f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}",
-            }
-
-        def upload_asset(
-            self, _release_id: int, path: Path, ownership_marker: str
-        ) -> dict[str, object]:
-            if not self.assets:
-                asset = self.make_asset(path, 1, ownership_marker)
-                self.assets.append(asset)
-                return copy.deepcopy(asset)
-            exact = self.make_asset(path, 2, ownership_marker)
-            drifted = self.make_asset(path, 3, ownership_marker)
-            drifted["digest"] = "sha256:" + "0" * 64
-            self.assets.extend([exact, drifted])
-            raise TimeoutError("POST response lost with mixed marker candidates")
-
-        def delete_asset(self, _release_id: int, asset_id: int) -> None:
-            self.deleted.append(asset_id)
-            self.assets = [asset for asset in self.assets if asset["id"] != asset_id]
-
-    github = FakeGitHub()
-    with pytest.raises(
-        ReleaseContractError, match="asset publication failed and rollback was incomplete"
-    ):
-        publish_assets_transactional(snapshot, manifest, dist, github)
-
-    assert github.deleted == [1]
-    assert [asset["id"] for asset in github.assets] == [2, 3]
-
-
-def test_lost_post_response_retries_pending_asset_recapture(tmp_path) -> None:
-    dist = _dist(tmp_path)
-    manifest = create_manifest(dist, project=PROJECT, version=VERSION)
-    snapshot = capture_snapshot(
-        repository="dcc-mcp/dcc-mcp-material-maker",
-        tag=TAG,
-        source_sha=SHA,
-        ref_payload=_ref(),
-        release_payload=_release(),
-    )
-
-    class FakeGitHub:
-        def __init__(self) -> None:
-            self.assets: list[dict[str, object]] = []
-            self.recaptures = 0
-            self.deleted: list[int] = []
-
-        def recapture_release(self, _snapshot):
-            self.recaptures += 1
-            if self.recaptures == 3:
-                raise TimeoutError("first recovery recapture was lost")
-            return _ref(), _release(assets=copy.deepcopy(self.assets))
-
-        def upload_asset(
-            self, _release_id: int, path: Path, ownership_marker: str
-        ) -> dict[str, object]:
-            self.assets.append(
-                {
-                    "id": 1,
-                    "name": path.name,
-                    "label": ownership_marker,
-                    "size": path.stat().st_size,
-                    "state": "uploaded",
-                    "digest": f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}",
-                }
-            )
-            raise TimeoutError("POST response lost after server commit")
-
-        def delete_asset(self, _release_id: int, asset_id: int) -> None:
-            self.deleted.append(asset_id)
-            self.assets = [asset for asset in self.assets if asset["id"] != asset_id]
-
-    github = FakeGitHub()
-    with pytest.raises(ReleaseContractError, match="GitHub asset publication failed"):
-        publish_assets_transactional(snapshot, manifest, dist, github)
-
-    assert github.deleted == [1]
-    assert github.assets == []
-
-
-def test_lost_post_response_recovers_asset_after_delayed_visibility(tmp_path) -> None:
-    dist = _dist(tmp_path)
-    manifest = create_manifest(dist, project=PROJECT, version=VERSION)
-    snapshot = capture_snapshot(
-        repository="dcc-mcp/dcc-mcp-material-maker",
-        tag=TAG,
-        source_sha=SHA,
-        ref_payload=_ref(),
-        release_payload=_release(),
-    )
-
-    class FakeGitHub:
-        def __init__(self) -> None:
-            self.assets: list[dict[str, object]] = []
-            self.recaptures = 0
-            self.deleted: list[int] = []
-
-        def recapture_release(self, _snapshot):
-            self.recaptures += 1
-            visible = self.assets if self.recaptures >= 4 else []
-            return _ref(), _release(assets=copy.deepcopy(visible))
-
-        def upload_asset(
-            self, _release_id: int, path: Path, ownership_marker: str
-        ) -> dict[str, object]:
-            self.assets.append(
-                {
-                    "id": 1,
-                    "name": path.name,
-                    "label": ownership_marker,
-                    "size": path.stat().st_size,
-                    "state": "uploaded",
-                    "digest": f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}",
-                }
-            )
-            raise TimeoutError("POST response lost before asset became visible")
-
-        def delete_asset(self, _release_id: int, asset_id: int) -> None:
-            self.deleted.append(asset_id)
-            self.assets = [asset for asset in self.assets if asset["id"] != asset_id]
-
-    github = FakeGitHub()
-    with pytest.raises(ReleaseContractError, match="GitHub asset publication failed"):
-        publish_assets_transactional(snapshot, manifest, dist, github)
-
-    assert github.deleted == [1]
-    assert github.assets == []
-
-
-@pytest.mark.parametrize(
-    ("field", "replacement"),
-    [
-        ("name", "contender.whl"),
-        ("digest", "sha256:" + "0" * 64),
-        ("size", 999_999),
-        ("state", "new"),
-        ("label", "another-transaction"),
-    ],
-)
-def test_rollback_preserves_identity_drift_and_continues_other_owned_assets(
-    tmp_path, field: str, replacement: object
-) -> None:
-    dist = _dist(tmp_path)
-    manifest = create_manifest(dist, project=PROJECT, version=VERSION)
-    snapshot = capture_snapshot(
-        repository="dcc-mcp/dcc-mcp-material-maker",
-        tag=TAG,
-        source_sha=SHA,
-        ref_payload=_ref(),
-        release_payload=_release(),
-    )
-
-    class FakeGitHub:
-        def __init__(self) -> None:
-            self.assets: list[dict[str, object]] = []
-            self.recaptures = 0
-            self.deleted: list[int] = []
-
-        def recapture_release(self, _snapshot):
-            self.recaptures += 1
-            payload = _release(assets=copy.deepcopy(self.assets))
-            if self.recaptures == 6:
-                self.assets[1][field] = replacement
-                payload = _release(
-                    assets=copy.deepcopy(self.assets),
-                    published_at="2026-08-27T00:00:02Z",
-                )
-            return _ref(), payload
-
-        def upload_asset(
-            self, _release_id: int, path: Path, ownership_marker: str
-        ) -> dict[str, object]:
-            asset = {
-                "id": len(self.assets) + 1,
-                "name": path.name,
-                "label": ownership_marker,
-                "size": path.stat().st_size,
-                "state": "uploaded",
-                "digest": f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}",
-            }
-            self.assets.append(asset)
-            return copy.deepcopy(asset)
-
-        def delete_asset(self, _release_id: int, asset_id: int) -> None:
-            self.deleted.append(asset_id)
-            self.assets = [asset for asset in self.assets if asset["id"] != asset_id]
-
-    github = FakeGitHub()
-    with pytest.raises(
-        ReleaseContractError, match="asset publication failed and rollback was incomplete"
-    ):
-        publish_assets_transactional(snapshot, manifest, dist, github)
-
-    assert github.deleted == [1]
-    assert [asset["id"] for asset in github.assets] == [2]
-
-
 def test_release_client_recaptures_and_uploads_only_by_numeric_release_id(
     tmp_path, monkeypatch
 ) -> None:
@@ -2359,7 +1660,7 @@ def test_release_client_recaptures_and_uploads_only_by_numeric_release_id(
     )
     asset = tmp_path / "artifact.whl"
     asset.write_bytes(b"wheel")
-    ownership_marker = f"dcc-mcp-tx-{'a' * 32}-1-{'b' * 12}"
+    ownership_marker = f"dcc-mcp-owned-v1-{'a' * 12}-{'b' * 12}"
     requests: list[tuple[str, str]] = []
 
     class Response(io.BytesIO):
