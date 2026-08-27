@@ -253,6 +253,18 @@ class _ArchiveMember:
     source: object
 
 
+@dataclasses.dataclass(frozen=True)
+class _WheelRawMember:
+    path: str
+    local_offset: int
+    record_end: int
+    extract_version: int
+    flags: int
+    compression: int
+    modified_time: int
+    modified_date: int
+
+
 def _validate_archive_members(
     members: Iterable[_ArchiveMember],
     *,
@@ -380,7 +392,27 @@ def _wheel_end_record(handle: Any, archive_size: int) -> tuple[int, tuple[object
     raise ReleaseContractError("distribution archive mismatch")
 
 
-def _preflight_wheel_raw_names(path: Path) -> list[tuple[str, int, int]]:
+def _validate_wheel_central_extra(extra: bytes) -> None:
+    offset = 0
+    zip64_seen = False
+    while offset < len(extra):
+        if len(extra) - offset < 4:
+            raise ReleaseContractError("distribution archive mismatch")
+        field_id, field_size = struct.unpack_from("<HH", extra, offset)
+        offset += 4
+        field_end = offset + field_size
+        if field_end > len(extra):
+            raise ReleaseContractError("distribution archive mismatch")
+        if field_id == 0x0001:
+            if zip64_seen:
+                raise ReleaseContractError("distribution archive mismatch")
+            zip64_seen = True
+        offset = field_end
+    if zip64_seen:
+        raise ReleaseContractError("distribution archive mismatch")
+
+
+def _preflight_wheel_raw_names(path: Path) -> list[_WheelRawMember]:
     archive_size = path.stat().st_size
     if archive_size < 22:
         raise ReleaseContractError("distribution archive mismatch")
@@ -402,7 +434,7 @@ def _preflight_wheel_raw_names(path: Path) -> list[tuple[str, int, int]]:
                 raise ReleaseContractError("distribution archive mismatch")
 
             handle.seek(central_offset)
-            members: list[tuple[str, int]] = []
+            members: list[tuple[str, int, int, int, int, int, int]] = []
             for _ in range(total_entries):
                 fixed = handle.read(46)
                 if len(fixed) != 46:
@@ -423,11 +455,22 @@ def _preflight_wheel_raw_names(path: Path) -> list[tuple[str, int, int]]:
                     or len(comment) != comment_length
                 ):
                     raise ReleaseContractError("distribution archive mismatch")
-                members.append((_strict_utf8_archive_name(raw_name), fields[16]))
+                _validate_wheel_central_extra(extra)
+                members.append(
+                    (
+                        _strict_utf8_archive_name(raw_name),
+                        fields[16],
+                        fields[2],
+                        fields[3],
+                        fields[4],
+                        fields[5],
+                        fields[6],
+                    )
+                )
             if handle.tell() != central_offset + central_size:
                 raise ReleaseContractError("distribution archive mismatch")
 
-            local_offsets = sorted(local_offset for _, local_offset in members)
+            local_offsets = sorted(member[1] for member in members)
             if (
                 len(set(local_offsets)) != len(local_offsets)
                 or not local_offsets
@@ -440,7 +483,7 @@ def _preflight_wheel_raw_names(path: Path) -> list[tuple[str, int, int]]:
                 )
                 for index, local_offset in enumerate(local_offsets)
             }
-            for decoded_name, local_offset in members:
+            for decoded_name, local_offset, *_central_fields in members:
                 handle.seek(local_offset)
                 fixed = handle.read(30)
                 if len(fixed) != 30:
@@ -457,21 +500,38 @@ def _preflight_wheel_raw_names(path: Path) -> list[tuple[str, int, int]]:
                     raise ReleaseContractError("distribution archive mismatch")
                 _strict_utf8_archive_name(raw_name, decoded_name)
             return [
-                (decoded_name, local_offset, record_ends[local_offset])
-                for decoded_name, local_offset in members
+                _WheelRawMember(
+                    path=decoded_name,
+                    local_offset=local_offset,
+                    record_end=record_ends[local_offset],
+                    extract_version=extract_version,
+                    flags=flags,
+                    compression=compression,
+                    modified_time=modified_time,
+                    modified_date=modified_date,
+                )
+                for (
+                    decoded_name,
+                    local_offset,
+                    extract_version,
+                    flags,
+                    compression,
+                    modified_time,
+                    modified_date,
+                ) in members
             ]
     except (OSError, struct.error) as error:
         raise ReleaseContractError("distribution archive mismatch") from error
 
 
 def _bind_wheel_raw_names(
-    archive: zipfile.ZipFile, raw_members: list[tuple[str, int, int]]
+    archive: zipfile.ZipFile, raw_members: list[_WheelRawMember]
 ) -> list[zipfile.ZipInfo]:
     infos = archive.infolist()
     if len(infos) != len(raw_members):
         raise ReleaseContractError("distribution archive mismatch")
-    for info, (raw_name, local_offset, _record_end) in zip(infos, raw_members):
-        if info.orig_filename != raw_name or info.header_offset != local_offset:
+    for info, raw_member in zip(infos, raw_members):
+        if info.orig_filename != raw_member.path or info.header_offset != raw_member.local_offset:
             raise ReleaseContractError("distribution archive mismatch")
     return infos
 
@@ -529,7 +589,7 @@ def _wheel_local_zip64_values(extra: bytes) -> tuple[int, int] | None:
 
 
 def _validate_wheel_local_header(
-    archive: zipfile.ZipFile, info: zipfile.ZipInfo, *, record_end: int
+    archive: zipfile.ZipFile, info: zipfile.ZipInfo, *, raw_member: _WheelRawMember
 ) -> None:
     handle = archive.fp
     if handle is None:
@@ -559,9 +619,11 @@ def _validate_wheel_local_header(
             signature != b"PK\x03\x04"
             or len(local_name) != name_length
             or len(local_extra) != extra_length
-            or extract_version != info.extract_version
-            or flags != info.flag_bits
-            or compression != info.compress_type
+            or extract_version != raw_member.extract_version
+            or flags != raw_member.flags
+            or compression != raw_member.compression
+            or _modified_time != raw_member.modified_time
+            or _modified_date != raw_member.modified_date
         ):
             raise ReleaseContractError("distribution archive mismatch")
         _strict_utf8_archive_name(local_name, info.orig_filename)
@@ -569,13 +631,10 @@ def _validate_wheel_local_header(
         uses_data_descriptor = bool(flags & 0x08)
         uses_zip64 = zip64_values is not None
         if uses_zip64:
-            if uses_data_descriptor:
-                if (compressed_size, size) not in {
-                    (0, 0),
-                    (0xFFFFFFFF, 0xFFFFFFFF),
-                }:
-                    raise ReleaseContractError("distribution archive mismatch")
-            elif (compressed_size, size) != (0xFFFFFFFF, 0xFFFFFFFF):
+            if not uses_data_descriptor and (compressed_size, size) != (
+                0xFFFFFFFF,
+                0xFFFFFFFF,
+            ):
                 raise ReleaseContractError("distribution archive mismatch")
             zip64_size, zip64_compressed_size = zip64_values
         else:
@@ -584,20 +643,28 @@ def _validate_wheel_local_header(
             zip64_size, zip64_compressed_size = size, compressed_size
         data_offset = info.header_offset + 30 + name_length + extra_length
         payload_end = data_offset + info.compress_size
-        if data_offset > payload_end or payload_end > record_end:
+        if data_offset > payload_end or payload_end > raw_member.record_end:
             raise ReleaseContractError("distribution archive mismatch")
         if uses_data_descriptor:
-            if (
-                crc not in {0, info.CRC}
-                or zip64_compressed_size not in {0, info.compress_size}
-                or zip64_size not in {0, info.file_size}
-            ):
+            if uses_zip64:
+                expected_sizes = {
+                    20: (0, 0),
+                    45: (0xFFFFFFFF, 0xFFFFFFFF),
+                }.get(extract_version)
+                if (
+                    crc != 0
+                    or expected_sizes is None
+                    or (compressed_size, size) != expected_sizes
+                    or (zip64_size, zip64_compressed_size) != (0, 0)
+                ):
+                    raise ReleaseContractError("distribution archive mismatch")
+            elif (crc, compressed_size, size) != (0, 0, 0):
                 raise ReleaseContractError("distribution archive mismatch")
             _validate_wheel_data_descriptor(
                 handle,
                 info,
                 descriptor_offset=payload_end,
-                record_end=record_end,
+                record_end=raw_member.record_end,
                 zip64=uses_zip64,
             )
         elif (crc, zip64_compressed_size, zip64_size) != (
@@ -643,13 +710,13 @@ def _validate_wheel_metadata(path: Path, *, project: str, version: str) -> None:
                 reserved_root_suffix=".dist-info",
             )
             payload: bytes | None = None
-            record_ends = {local_offset: record_end for _, local_offset, record_end in raw_members}
+            raw_by_offset = {member.local_offset: member for member in raw_members}
             for member in members:
                 info = member.source
                 if not isinstance(info, zipfile.ZipInfo):
                     raise ReleaseContractError("distribution archive mismatch")
                 _validate_wheel_local_header(
-                    archive, info, record_end=record_ends[info.header_offset]
+                    archive, info, raw_member=raw_by_offset[info.header_offset]
                 )
                 if member.is_file:
                     with archive.open(info) as handle:

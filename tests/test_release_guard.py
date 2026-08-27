@@ -268,6 +268,7 @@ def _corrupt_descriptor_wheel_structure(path: Path, corruption: str) -> None:
     central_offset = struct.unpack_from("<I", raw, end_offset + 16)[0]
     central_header = raw.index(b"PK\x01\x02", central_offset)
     local_header = struct.unpack_from("<I", raw, central_header + 42)[0]
+    crc, compressed_size, size = struct.unpack_from("<III", raw, central_header + 16)
 
     if corruption == "local-flags":
         local_flags = struct.unpack_from("<H", raw, local_header + 6)[0]
@@ -303,6 +304,42 @@ def _corrupt_descriptor_wheel_structure(path: Path, corruption: str) -> None:
         name_length = struct.unpack_from("<H", raw, local_header + 26)[0]
         extra_offset = local_header + 30 + name_length
         struct.pack_into("<H", raw, extra_offset + 2, 17)
+    elif corruption == "classic-local-values-populated":
+        struct.pack_into("<III", raw, local_header + 14, crc, compressed_size, size)
+    elif corruption == "zip64-local-size-signal-conflict":
+        local_sizes = struct.unpack_from("<II", raw, local_header + 18)
+        replacement = (
+            (0, 0) if local_sizes == (0xFFFFFFFF, 0xFFFFFFFF) else (0xFFFFFFFF, 0xFFFFFFFF)
+        )
+        struct.pack_into("<II", raw, local_header + 18, *replacement)
+    elif corruption == "zip64-local-extra-populated":
+        name_length = struct.unpack_from("<H", raw, local_header + 26)[0]
+        extra_offset = local_header + 30 + name_length
+        assert struct.unpack_from("<HH", raw, extra_offset) == (1, 16)
+        struct.pack_into("<QQ", raw, extra_offset + 4, size, compressed_size)
+    elif corruption == "central-time-conflict":
+        modified_time = struct.unpack_from("<H", raw, central_header + 12)[0]
+        struct.pack_into("<H", raw, central_header + 12, modified_time ^ 1)
+    elif corruption in {
+        "central-zip64-extra",
+        "central-duplicate-zip64-extra",
+        "central-malformed-zip64-extra",
+    }:
+        central_name_length, central_extra_length = struct.unpack_from(
+            "<HH", raw, central_header + 28
+        )
+        assert central_extra_length == 0
+        if corruption == "central-malformed-zip64-extra":
+            fields = struct.pack("<HHQ", 1, 16, size)
+        else:
+            field = struct.pack("<HHQQ", 1, 16, size, compressed_size)
+            fields = field if corruption == "central-zip64-extra" else field * 2
+        insertion = central_header + 46 + central_name_length
+        raw[insertion:insertion] = fields
+        struct.pack_into("<H", raw, central_header + 30, len(fields))
+        new_end_offset = end_offset + len(fields)
+        central_size = struct.unpack_from("<I", raw, new_end_offset + 12)[0]
+        struct.pack_into("<I", raw, new_end_offset + 12, central_size + len(fields))
     else:  # pragma: no cover - test helper contract
         raise AssertionError(f"unknown corruption: {corruption}")
     path.write_bytes(raw)
@@ -365,8 +402,8 @@ def _replace_distribution_metadata(dist: Path, kind: str, payload: bytes) -> Non
         archive.addfile(member, io.BytesIO(payload))
 
 
-def _write_current_dist_manifest(dist: Path, manifest_path: Path) -> str:
-    manifest = {
+def _current_dist_manifest(dist: Path) -> dict[str, object]:
+    return {
         "schema_version": 1,
         "project": PROJECT,
         "version": VERSION,
@@ -379,6 +416,10 @@ def _write_current_dist_manifest(dist: Path, manifest_path: Path) -> str:
             for path in sorted(dist.iterdir(), key=lambda item: item.name)
         ],
     }
+
+
+def _write_current_dist_manifest(dist: Path, manifest_path: Path) -> str:
+    manifest = _current_dist_manifest(dist)
     return write_manifest(manifest, manifest_path)
 
 
@@ -979,6 +1020,147 @@ def test_wheel_validation_rejects_descriptor_record_conflicts(
             manifest_path = tmp_path / "manifest.json"
             manifest_sha256 = _write_current_dist_manifest(dist, manifest_path)
             verify_manifest(manifest_path, dist, manifest_sha256)
+
+
+def test_manifest_creation_rejects_classic_descriptor_with_populated_local_values(
+    tmp_path,
+) -> None:
+    dist = _dist(tmp_path)
+    wheel = dist / "dcc_mcp_material_maker-0.4.1-py3-none-any.whl"
+    _corrupt_descriptor_wheel_structure(wheel, "classic-local-values-populated")
+
+    with pytest.raises(ReleaseContractError, match="distribution archive mismatch"):
+        create_manifest(dist, project=PROJECT, version=VERSION)
+
+
+@pytest.mark.parametrize(
+    "corruption", ["zip64-local-size-signal-conflict", "zip64-local-extra-populated"]
+)
+def test_manifest_creation_rejects_noncanonical_zip64_descriptor_local_signals(
+    tmp_path, corruption: str
+) -> None:
+    dist = _dist(tmp_path)
+    wheel = dist / "dcc_mcp_material_maker-0.4.1-py3-none-any.whl"
+    _corrupt_descriptor_wheel_structure(wheel, corruption)
+
+    with pytest.raises(ReleaseContractError, match="distribution archive mismatch"):
+        create_manifest(dist, project=PROJECT, version=VERSION)
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "central-time-conflict",
+        "central-zip64-extra",
+        "central-duplicate-zip64-extra",
+        "central-malformed-zip64-extra",
+    ],
+)
+def test_manifest_creation_rejects_conflicting_or_noncanonical_central_metadata(
+    tmp_path, corruption: str
+) -> None:
+    dist = _dist(tmp_path)
+    wheel = dist / "dcc_mcp_material_maker-0.4.1-py3-none-any.whl"
+    _corrupt_descriptor_wheel_structure(wheel, corruption)
+
+    with pytest.raises(ReleaseContractError, match="distribution archive mismatch"):
+        create_manifest(dist, project=PROJECT, version=VERSION)
+
+
+@pytest.mark.parametrize("consumer", ["create", "verify", "pypi", "publisher"])
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "classic-local-values-populated",
+        "zip64-local-size-signal-conflict",
+        "zip64-local-extra-populated",
+        "central-time-conflict",
+        "central-duplicate-zip64-extra",
+    ],
+)
+def test_every_release_consumer_rejects_noncanonical_descriptor_metadata_before_mutation(
+    tmp_path, monkeypatch, capsys, consumer: str, corruption: str
+) -> None:
+    dist = _dist(tmp_path)
+    wheel = dist / "dcc_mcp_material_maker-0.4.1-py3-none-any.whl"
+    _corrupt_descriptor_wheel_structure(wheel, corruption)
+
+    if consumer == "create":
+        with pytest.raises(ReleaseContractError, match="distribution archive mismatch"):
+            create_manifest(dist, project=PROJECT, version=VERSION)
+        return
+
+    state_dir = tmp_path / "release"
+    manifest_path = state_dir / "manifest.json"
+    manifest_sha256 = _write_current_dist_manifest(dist, manifest_path)
+    if consumer == "verify":
+        with pytest.raises(ReleaseContractError, match="distribution archive mismatch"):
+            verify_manifest(manifest_path, dist, manifest_sha256)
+        return
+
+    if consumer == "pypi":
+        monkeypatch.setattr(release_guard, "_verify_local_checkout", lambda _sha: None)
+
+        def fail_if_snapshot_is_loaded(*_args, **_kwargs):
+            raise AssertionError("PyPI validation must reject the wheel before live-state access")
+
+        monkeypatch.setattr(release_guard, "_load_snapshot", fail_if_snapshot_is_loaded)
+        assert (
+            release_guard.main(
+                [
+                    "verify",
+                    "--repository",
+                    "dcc-mcp/dcc-mcp-material-maker",
+                    "--tag",
+                    TAG,
+                    "--source-sha",
+                    SHA,
+                    "--dist-dir",
+                    str(dist),
+                    "--state-dir",
+                    str(state_dir),
+                    "--expected-release-id",
+                    "12345",
+                    "--expected-manifest-sha256",
+                    manifest_sha256,
+                    "--expected-snapshot-sha256",
+                    "0" * 64,
+                    "--artifact-id",
+                    str(ARTIFACT_ID),
+                    "--artifact-digest",
+                    ARTIFACT_DIGEST,
+                    "--run-id",
+                    str(RUN_ID),
+                    "--expect-no-assets",
+                ]
+            )
+            == 1
+        )
+        assert "release guard failed: distribution archive mismatch" in capsys.readouterr().err
+        return
+
+    snapshot = capture_snapshot(
+        repository="dcc-mcp/dcc-mcp-material-maker",
+        tag=TAG,
+        source_sha=SHA,
+        ref_payload=_ref(),
+        release_payload=_release(),
+    )
+
+    class NoGitHubMutation:
+        def recapture_artifact(self, _artifact_id: int):
+            raise AssertionError("GitHub must not be called before archive validation")
+
+        def __getattr__(self, name: str):
+            raise AssertionError(f"GitHub must not be called before archive validation: {name}")
+
+    with pytest.raises(ReleaseContractError, match="distribution archive mismatch"):
+        publish_assets_transactional(
+            snapshot,
+            _current_dist_manifest(dist),
+            dist,
+            NoGitHubMutation(),
+        )
 
 
 def test_asset_publisher_reuses_shared_descriptor_validator_before_github_mutation(
