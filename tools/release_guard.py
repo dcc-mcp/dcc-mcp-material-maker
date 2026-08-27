@@ -44,6 +44,19 @@ ARCHIVE_MAX_MEMBER_SIZE = 16 * 1024 * 1024
 ARCHIVE_MAX_TOTAL_SIZE = 64 * 1024 * 1024
 ARCHIVE_MAX_COMPRESSION_RATIO = 100
 ROLLBACK_MAX_ATTEMPTS = 3
+APPROVED_REQUIRES_PYTHON = ">=3.9"
+APPROVED_REQUIRES_DIST = frozenset(
+    {
+        "dcc-mcp-core<1.0.0,>=0.20.14",
+        "build>=1.2; extra == 'dev'",
+        "jsonschema<5,>=4.17; extra == 'dev'",
+        "pytest>=8; extra == 'dev'",
+        "pyyaml<7,>=6; extra == 'dev'",
+        "ruff>=0.8; extra == 'dev'",
+        "tomli<3,>=2; (python_version < '3.11') and extra == 'dev'",
+        "twine>=7.0; (python_version >= '3.10') and extra == 'dev'",
+    }
+)
 
 
 class ReleaseContractError(RuntimeError):
@@ -110,6 +123,16 @@ class ReleaseSnapshot:
         return snapshot
 
 
+@dataclasses.dataclass(frozen=True)
+class ArtifactBinding:
+    repository: str
+    artifact_id: int
+    artifact_digest: str
+    source_sha: str
+    run_id: int
+    name: str
+
+
 def _canonical_json(payload: object) -> bytes:
     text = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return (text + "\n").encode("utf-8")
@@ -167,9 +190,14 @@ def _validate_metadata(payload: bytes, *, project: str, version: str) -> None:
         raise ReleaseContractError("distribution metadata mismatch") from error
     names = message.get_all("Name", [])
     versions = message.get_all("Version", [])
+    requires_python = message.get_all("Requires-Python", [])
+    requires_dist = [str(requirement) for requirement in message.get_all("Requires-Dist", [])]
     if (
         len(names) != 1
         or len(versions) != 1
+        or requires_python != [APPROVED_REQUIRES_PYTHON]
+        or len(requires_dist) != len(APPROVED_REQUIRES_DIST)
+        or set(requires_dist) != APPROVED_REQUIRES_DIST
         or _canonical_project_name(str(names[0])) != _canonical_project_name(project)
         or str(versions[0]) != version
     ):
@@ -178,7 +206,7 @@ def _validate_metadata(payload: bytes, *, project: str, version: str) -> None:
 
 _WINDOWS_FORBIDDEN_MEMBER_CHARACTERS = frozenset('<>:"|?*')
 _WINDOWS_RESERVED_MEMBER_NAMES = frozenset(
-    {"con", "prn", "aux", "nul"}
+    {"con", "prn", "aux", "nul", "clock$", "conin$", "conout$"}
     | {f"com{index}" for index in range(1, 10)}
     | {f"lpt{index}" for index in range(1, 10)}
 )
@@ -199,11 +227,12 @@ def _canonical_archive_member_key(name: str) -> str:
             part in {"", ".", ".."}
             or normalized in {"", ".", ".."}
             or key in {"", ".", ".."}
+            or any(separator in normalized or separator in key for separator in ("/", "\\"))
             or part.endswith((".", " "))
             or normalized.endswith((".", " "))
             or key.endswith((".", " "))
             or any(
-                unicodedata.category(character) in {"Cc", "Cf"}
+                unicodedata.category(character).startswith("C")
                 or character in _WINDOWS_FORBIDDEN_MEMBER_CHARACTERS
                 for character in normalized
             )
@@ -323,6 +352,112 @@ def _read_regular_member(handle: Any, *, expected_size: int, capture: bool) -> b
     return bytes(payload)
 
 
+def _strict_utf8_archive_name(raw_name: bytes, expected_name: str | None = None) -> str:
+    try:
+        decoded = raw_name.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise ReleaseContractError("distribution archive mismatch") from error
+    _canonical_archive_member_key(decoded)
+    if expected_name is not None and decoded != expected_name:
+        raise ReleaseContractError("distribution archive mismatch")
+    return decoded
+
+
+def _wheel_end_record(handle: Any, archive_size: int) -> tuple[int, tuple[object, ...]]:
+    tail_size = min(archive_size, 22 + 65_535)
+    handle.seek(archive_size - tail_size)
+    tail = handle.read(tail_size)
+    search_end = len(tail)
+    while search_end:
+        offset = tail.rfind(b"PK\x05\x06", 0, search_end)
+        if offset < 0:
+            break
+        if offset + 22 <= len(tail):
+            fields = struct.unpack("<4s4H2IH", tail[offset : offset + 22])
+            if offset + 22 + fields[7] == len(tail):
+                return archive_size - tail_size + offset, fields
+        search_end = offset
+    raise ReleaseContractError("distribution archive mismatch")
+
+
+def _preflight_wheel_raw_names(path: Path) -> list[tuple[str, int]]:
+    archive_size = path.stat().st_size
+    if archive_size < 22:
+        raise ReleaseContractError("distribution archive mismatch")
+    try:
+        with path.open("rb") as handle:
+            end_offset, end_fields = _wheel_end_record(handle, archive_size)
+            disk_number, central_disk, disk_entries, total_entries = end_fields[1:5]
+            central_size, central_offset = end_fields[5:7]
+            if (
+                disk_number != 0
+                or central_disk != 0
+                or disk_entries != total_entries
+                or total_entries > ARCHIVE_MAX_MEMBERS
+                or total_entries == 0xFFFF
+                or central_size == 0xFFFFFFFF
+                or central_offset == 0xFFFFFFFF
+                or central_offset + central_size != end_offset
+            ):
+                raise ReleaseContractError("distribution archive mismatch")
+
+            handle.seek(central_offset)
+            members: list[tuple[str, int]] = []
+            for _ in range(total_entries):
+                fixed = handle.read(46)
+                if len(fixed) != 46:
+                    raise ReleaseContractError("distribution archive mismatch")
+                fields = struct.unpack("<4s6H3I5H2I", fixed)
+                name_length, extra_length, comment_length = fields[10:13]
+                raw_name = handle.read(name_length)
+                extra = handle.read(extra_length)
+                comment = handle.read(comment_length)
+                if (
+                    fields[0] != b"PK\x01\x02"
+                    or fields[13] != 0
+                    or fields[16] == 0xFFFFFFFF
+                    or len(raw_name) != name_length
+                    or len(extra) != extra_length
+                    or len(comment) != comment_length
+                ):
+                    raise ReleaseContractError("distribution archive mismatch")
+                members.append((_strict_utf8_archive_name(raw_name), fields[16]))
+            if handle.tell() != central_offset + central_size:
+                raise ReleaseContractError("distribution archive mismatch")
+
+            for decoded_name, local_offset in members:
+                handle.seek(local_offset)
+                fixed = handle.read(30)
+                if len(fixed) != 30:
+                    raise ReleaseContractError("distribution archive mismatch")
+                local_fields = struct.unpack("<4s5H3I2H", fixed)
+                name_length, extra_length = local_fields[9:11]
+                raw_name = handle.read(name_length)
+                extra = handle.read(extra_length)
+                if (
+                    local_fields[0] != b"PK\x03\x04"
+                    or len(raw_name) != name_length
+                    or len(extra) != extra_length
+                ):
+                    raise ReleaseContractError("distribution archive mismatch")
+                _strict_utf8_archive_name(raw_name, decoded_name)
+            return members
+    except (OSError, struct.error) as error:
+        raise ReleaseContractError("distribution archive mismatch") from error
+
+
+def _bind_wheel_raw_names(
+    archive: zipfile.ZipFile, raw_members: list[tuple[str, int]]
+) -> list[zipfile.ZipInfo]:
+    infos = archive.infolist()
+    if len(infos) != len(raw_members):
+        raise ReleaseContractError("distribution archive mismatch")
+    for info, (raw_name, local_offset) in zip(infos, raw_members):
+        if info.orig_filename != raw_name or info.header_offset != local_offset:
+            raise ReleaseContractError("distribution archive mismatch")
+    return infos
+
+
 def _validate_wheel_local_header(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> None:
     handle = archive.fp
     if handle is None:
@@ -356,6 +491,7 @@ def _validate_wheel_local_header(archive: zipfile.ZipFile, info: zipfile.ZipInfo
             or compression != info.compress_type
         ):
             raise ReleaseContractError("distribution archive mismatch")
+        _strict_utf8_archive_name(local_name, info.orig_filename)
         uses_data_descriptor = bool(flags & 0x08)
         if uses_data_descriptor:
             if (
@@ -390,9 +526,11 @@ def _validate_wheel_metadata(path: Path, *, project: str, version: str) -> None:
     expected_root = f"{_normalized_distribution_name(project)}-{version}.dist-info"
     expected_metadata = f"{expected_root}/METADATA"
     try:
+        raw_members = _preflight_wheel_raw_names(path)
         with zipfile.ZipFile(path) as archive:
+            infos = _bind_wheel_raw_names(archive, raw_members)
             metadata, members = _validate_archive_members(
-                (_wheel_member(info) for info in archive.infolist()),
+                (_wheel_member(info) for info in infos),
                 archive_size=path.stat().st_size,
                 expected_metadata=expected_metadata,
                 metadata_basename="METADATA",
@@ -426,7 +564,7 @@ def _validate_sdist_metadata(path: Path, *, project: str, version: str) -> None:
     expected_root = f"{_normalized_distribution_name(project)}-{version}"
     expected_metadata = f"{expected_root}/PKG-INFO"
     try:
-        with tarfile.open(path, "r:gz") as archive:
+        with tarfile.open(path, "r:gz", encoding="utf-8", errors="strict") as archive:
             metadata, members = _validate_archive_members(
                 (
                     _ArchiveMember(
@@ -460,7 +598,7 @@ def _validate_sdist_metadata(path: Path, *, project: str, version: str) -> None:
                     )
                 if member is metadata:
                     payload = member_payload
-    except (OSError, EOFError, tarfile.TarError) as error:
+    except (OSError, EOFError, UnicodeError, tarfile.TarError) as error:
         raise ReleaseContractError("distribution archive mismatch") from error
     if payload is None:
         raise ReleaseContractError("distribution archive mismatch")
@@ -1001,11 +1139,29 @@ def verify_artifact_metadata(
         raise ReleaseContractError("artifact source branch drift")
 
 
+def _recapture_bound_artifact(
+    snapshot: ReleaseSnapshot, binding: ArtifactBinding, github: Any
+) -> None:
+    if binding.repository != snapshot.repository or binding.source_sha != snapshot.source_sha:
+        raise ReleaseContractError("artifact release binding drift")
+    verify_artifact_metadata(
+        github.recapture_artifact(binding.artifact_id),
+        repository=binding.repository,
+        artifact_id=binding.artifact_id,
+        artifact_digest=binding.artifact_digest,
+        source_sha=binding.source_sha,
+        run_id=binding.run_id,
+        name=binding.name,
+    )
+
+
 def publish_assets_transactional(
     snapshot: ReleaseSnapshot,
     manifest: dict[str, object],
     dist_dir: Path,
     github: Any,
+    *,
+    artifact_binding: ArtifactBinding,
 ) -> None:
     """Publish every distribution to one numeric Release ID or restore an empty set."""
 
@@ -1032,6 +1188,7 @@ def publish_assets_transactional(
     try:
         for index, (filename, artifact) in enumerate(expected.items(), start=1):
             pending = None
+            _recapture_bound_artifact(snapshot, artifact_binding, github)
             ref_payload, release_payload = github.recapture_release(snapshot)
             verify_snapshot(
                 snapshot,
@@ -1044,8 +1201,11 @@ def publish_assets_transactional(
             ownership_markers.add(marker)
             pending = (artifact, marker)
             response = github.upload_asset(snapshot.release_id, dist_dir / filename, marker)
-            uploaded.append(_record_uploaded_asset(response))
-            _validate_uploaded_asset(response, artifact, marker)
+            validated = _validate_uploaded_asset(response, artifact, marker)
+            current_assets = _recapture_release_assets(snapshot, github)
+            if current_assets != [*uploaded, validated]:
+                raise ReleaseContractError("release asset set drift")
+            uploaded.append(_record_uploaded_asset(validated))
             pending = None
 
         ref_payload, release_payload = github.recapture_release(snapshot)
@@ -1338,7 +1498,20 @@ def _publish_assets_command(args: argparse.Namespace) -> None:
         expect_no_assets=True,
     )
     client = GitHubReleaseClient(args.repository, args.github_token)
-    publish_assets_transactional(snapshot, manifest, args.dist_dir, client)
+    publish_assets_transactional(
+        snapshot,
+        manifest,
+        args.dist_dir,
+        client,
+        artifact_binding=ArtifactBinding(
+            repository=args.repository,
+            artifact_id=args.artifact_id,
+            artifact_digest=args.artifact_digest,
+            source_sha=args.source_sha,
+            run_id=args.run_id,
+            name=args.artifact_name,
+        ),
+    )
 
 
 def _parser() -> argparse.ArgumentParser:

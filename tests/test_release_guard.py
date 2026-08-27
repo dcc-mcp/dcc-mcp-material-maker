@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import gzip
 import hashlib
 import io
 import json
@@ -19,12 +20,14 @@ from tools.release_guard import (
     ReleaseContractError,
     capture_snapshot,
     create_manifest,
-    publish_assets_transactional,
     verify_artifact_metadata,
     verify_manifest,
     verify_published_assets,
     verify_snapshot,
     write_manifest,
+)
+from tools.release_guard import (
+    publish_assets_transactional as _publish_assets_transactional,
 )
 
 try:
@@ -37,6 +40,19 @@ TAG = "v0.4.1"
 PROJECT = "dcc-mcp-material-maker"
 VERSION = "0.4.1"
 ROOT = Path(__file__).resolve().parents[1]
+ARTIFACT_ID = 987
+ARTIFACT_DIGEST = "a" * 64
+RUN_ID = 2468
+APPROVED_REQUIRES_DIST = (
+    "dcc-mcp-core<1.0.0,>=0.20.14",
+    "build>=1.2; extra == 'dev'",
+    "jsonschema<5,>=4.17; extra == 'dev'",
+    "pytest>=8; extra == 'dev'",
+    "pyyaml<7,>=6; extra == 'dev'",
+    "ruff>=0.8; extra == 'dev'",
+    "tomli<3,>=2; (python_version < '3.11') and extra == 'dev'",
+    "twine>=7.0; (python_version >= '3.10') and extra == 'dev'",
+)
 
 
 def _ref(sha: str = SHA) -> dict[str, object]:
@@ -68,8 +84,88 @@ def _release(**changes: object) -> dict[str, object]:
     return payload
 
 
-def _metadata(project: str = PROJECT, version: str = VERSION) -> bytes:
-    return (f"Metadata-Version: 2.4\nName: {project}\nVersion: {version}\n\n").encode()
+def _artifact_binding():
+    return release_guard.ArtifactBinding(
+        repository="dcc-mcp/dcc-mcp-material-maker",
+        artifact_id=ARTIFACT_ID,
+        artifact_digest=ARTIFACT_DIGEST,
+        source_sha=SHA,
+        run_id=RUN_ID,
+        name="release-distributions",
+    )
+
+
+def _artifact_metadata() -> dict[str, object]:
+    repository = "dcc-mcp/dcc-mcp-material-maker"
+    url = f"https://api.github.com/repos/{repository}/actions/artifacts/{ARTIFACT_ID}"
+    return {
+        "id": ARTIFACT_ID,
+        "name": "release-distributions",
+        "size_in_bytes": 1234,
+        "url": url,
+        "archive_download_url": f"{url}/zip",
+        "expired": False,
+        "digest": f"sha256:{ARTIFACT_DIGEST}",
+        "created_at": "2026-08-27T00:00:00Z",
+        "updated_at": "2026-08-27T00:00:01Z",
+        "expires_at": "2099-08-27T00:00:00Z",
+        "workflow_run": {
+            "id": RUN_ID,
+            "repository_id": 123,
+            "head_repository_id": 123,
+            "head_sha": SHA,
+            "head_branch": "main",
+        },
+    }
+
+
+class _ArtifactBoundClient:
+    def __init__(self, target: object) -> None:
+        self._target = target
+
+    def recapture_artifact(self, artifact_id: int) -> dict[str, object]:
+        assert artifact_id == ARTIFACT_ID
+        return _artifact_metadata()
+
+    def __getattr__(self, name: str):
+        return getattr(self._target, name)
+
+
+def publish_assets_transactional(
+    snapshot,
+    manifest,
+    dist,
+    github,
+    *,
+    artifact_binding=None,
+) -> None:
+    client = github if hasattr(github, "recapture_artifact") else _ArtifactBoundClient(github)
+    _publish_assets_transactional(
+        snapshot,
+        manifest,
+        dist,
+        client,
+        artifact_binding=artifact_binding or _artifact_binding(),
+    )
+
+
+def _metadata(
+    project: str = PROJECT,
+    version: str = VERSION,
+    *,
+    requires_python: str = ">=3.9",
+    requires_dist: tuple[str, ...] = APPROVED_REQUIRES_DIST,
+) -> bytes:
+    fields = [
+        "Metadata-Version: 2.5",
+        f"Name: {project}",
+        f"Version: {version}",
+        f"Requires-Python: {requires_python}",
+        *(f"Requires-Dist: {requirement}" for requirement in requires_dist),
+        "",
+        "",
+    ]
+    return "\n".join(fields).encode()
 
 
 def _write_wheel(path: Path, *, project: str = PROJECT, version: str = VERSION) -> None:
@@ -120,6 +216,23 @@ def _append_archive_members(dist: Path, kind: str, paths: list[str]) -> None:
             archive.addfile(member, io.BytesIO(payload))
 
 
+def _replace_distribution_metadata(dist: Path, kind: str, payload: bytes) -> None:
+    if kind == "wheel":
+        wheel = dist / "dcc_mcp_material_maker-0.4.1-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr(
+                "dcc_mcp_material_maker-0.4.1.dist-info/METADATA",
+                payload,
+            )
+        return
+
+    sdist = dist / "dcc_mcp_material_maker-0.4.1.tar.gz"
+    member = tarfile.TarInfo("dcc_mcp_material_maker-0.4.1/PKG-INFO")
+    member.size = len(payload)
+    with tarfile.open(sdist, "w:gz") as archive:
+        archive.addfile(member, io.BytesIO(payload))
+
+
 def _write_current_dist_manifest(dist: Path, manifest_path: Path) -> str:
     manifest = {
         "schema_version": 1,
@@ -156,6 +269,30 @@ def _corrupt_non_metadata_wheel_member(wheel: Path, corruption: str) -> None:
     wheel.write_bytes(raw)
 
 
+def _replace_raw_archive_member_name(dist: Path, kind: str) -> None:
+    safe_name = b"rawx.txt"
+    invalid_name = b"raw\xff.txt"
+    if kind == "wheel":
+        wheel = dist / "dcc_mcp_material_maker-0.4.1-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "a") as archive:
+            archive.writestr(f"dcc_mcp_material_maker/{safe_name.decode()}", b"payload")
+        raw = wheel.read_bytes()
+        assert raw.count(safe_name) == 2
+        wheel.write_bytes(raw.replace(safe_name, invalid_name))
+        return
+
+    _append_archive_members(dist, "sdist", [safe_name.decode()])
+    sdist = dist / "dcc_mcp_material_maker-0.4.1.tar.gz"
+    raw_tar = bytearray(gzip.decompress(sdist.read_bytes()))
+    member_offset = raw_tar.index(safe_name)
+    header_offset = member_offset - (member_offset % 512)
+    raw_tar[member_offset : member_offset + len(safe_name)] = invalid_name
+    raw_tar[header_offset + 148 : header_offset + 156] = b"        "
+    checksum = sum(raw_tar[header_offset : header_offset + 512])
+    raw_tar[header_offset + 148 : header_offset + 156] = f"{checksum:06o}\0 ".encode()
+    sdist.write_bytes(gzip.compress(bytes(raw_tar), mtime=0))
+
+
 def test_manifest_binds_exact_wheel_and_sdist_bytes(tmp_path) -> None:
     dist = _dist(tmp_path)
     manifest = create_manifest(dist, project=PROJECT, version=VERSION)
@@ -180,6 +317,56 @@ def test_manifest_binds_exact_wheel_and_sdist_bytes(tmp_path) -> None:
     (dist / "dcc_mcp_material_maker-0.4.1.tar.gz").write_bytes(b"tampered")
     with pytest.raises(ReleaseContractError, match="artifact digest mismatch"):
         verify_manifest(manifest_path, dist, manifest_sha256)
+
+
+@pytest.mark.parametrize("phase", ["create", "verify"])
+@pytest.mark.parametrize("kind", ["wheel", "sdist"])
+@pytest.mark.parametrize(
+    ("requires_python", "requires_dist"),
+    [
+        ("<3", APPROVED_REQUIRES_DIST),
+        (">=3.9", ("attacker-controlled-package",)),
+        (">=3.9", APPROVED_REQUIRES_DIST + ("attacker-controlled-package",)),
+        (">=3.9", APPROVED_REQUIRES_DIST[:-1]),
+        (
+            ">=3.9",
+            ("dcc-mcp-core>=0.20.14",) + APPROVED_REQUIRES_DIST[1:],
+        ),
+        (
+            ">=3.9",
+            APPROVED_REQUIRES_DIST[:-1] + ("twine>=7.0; extra == 'dev'",),
+        ),
+    ],
+    ids=[
+        "incompatible-python",
+        "attacker-only-dependency",
+        "extra-dependency",
+        "missing-dependency",
+        "changed-specifier",
+        "changed-marker",
+    ],
+)
+def test_distribution_metadata_requires_the_frozen_approved_contract(
+    tmp_path,
+    phase: str,
+    kind: str,
+    requires_python: str,
+    requires_dist: tuple[str, ...],
+) -> None:
+    dist = _dist(tmp_path)
+    _replace_distribution_metadata(
+        dist,
+        kind,
+        _metadata(requires_python=requires_python, requires_dist=requires_dist),
+    )
+
+    with pytest.raises(ReleaseContractError, match="distribution metadata mismatch"):
+        if phase == "create":
+            create_manifest(dist, project=PROJECT, version=VERSION)
+        else:
+            manifest_path = tmp_path / "manifest.json"
+            manifest_sha256 = _write_current_dist_manifest(dist, manifest_path)
+            verify_manifest(manifest_path, dist, manifest_sha256)
 
 
 @pytest.mark.parametrize(
@@ -432,6 +619,11 @@ def test_manifest_rejects_unsafe_archive_paths(tmp_path, unsafe_path: str) -> No
         ["pkg/name", "pkg/name "],
         ["pkg/CON"],
         ["pkg/com1.txt"],
+        ["pkg/CONIN$"],
+        ["pkg/CONOUT$.txt"],
+        ["pkg/CLOCK$"],
+        ["pkg\uff0fchild.txt"],
+        ["pkg\uff3cchild.txt"],
         ["pkg/file.txt:stream"],
         ["pkg/bad?.txt"],
         ["pkg/parent", "pkg/parent/child.txt"],
@@ -446,6 +638,11 @@ def test_manifest_rejects_unsafe_archive_paths(tmp_path, unsafe_path: str) -> No
         "trailing-space-alias",
         "reserved-name",
         "device-name-with-extension",
+        "console-input-device",
+        "console-output-device-with-extension",
+        "clock-device",
+        "nfkc-forward-separator",
+        "nfkc-backward-separator",
         "alternate-data-stream",
         "windows-forbidden-character",
         "file-before-child",
@@ -494,6 +691,23 @@ def test_archive_explicit_directory_with_child_is_valid(tmp_path, kind: str) -> 
     manifest_path = tmp_path / "manifest.json"
     manifest_sha256 = write_manifest(manifest, manifest_path)
     assert verify_manifest(manifest_path, dist, manifest_sha256) == manifest
+
+
+@pytest.mark.parametrize("phase", ["create", "verify"])
+@pytest.mark.parametrize("kind", ["wheel", "sdist"])
+def test_archive_rejects_non_utf8_raw_member_names_before_canonicalization(
+    tmp_path, phase: str, kind: str
+) -> None:
+    dist = _dist(tmp_path)
+    _replace_raw_archive_member_name(dist, kind)
+
+    with pytest.raises(ReleaseContractError, match="distribution archive mismatch"):
+        if phase == "create":
+            create_manifest(dist, project=PROJECT, version=VERSION)
+        else:
+            manifest_path = tmp_path / "manifest.json"
+            manifest_sha256 = _write_current_dist_manifest(dist, manifest_path)
+            verify_manifest(manifest_path, dist, manifest_sha256)
 
 
 @pytest.mark.parametrize("phase", ["create", "verify"])
@@ -1108,7 +1322,50 @@ def test_asset_rollback_retry_exhaustion_is_bounded_and_fail_closed(tmp_path) ->
     assert [asset["id"] for asset in github.assets] == [1]
 
 
-def test_asset_publication_rolls_back_asset_created_with_bad_server_digest(tmp_path) -> None:
+def test_unvalidated_upload_response_never_enters_owned_rollback_state(tmp_path) -> None:
+    dist = _dist(tmp_path)
+    manifest = create_manifest(dist, project=PROJECT, version=VERSION)
+    snapshot = capture_snapshot(
+        repository="dcc-mcp/dcc-mcp-material-maker",
+        tag=TAG,
+        source_sha=SHA,
+        ref_payload=_ref(),
+        release_payload=_release(),
+    )
+
+    class FakeGitHub:
+        def __init__(self) -> None:
+            self.assets: list[dict[str, object]] = []
+            self.deleted: list[int] = []
+
+        def recapture_release(self, _snapshot):
+            return _ref(), _release(assets=copy.deepcopy(self.assets))
+
+        def upload_asset(self, _release_id: int, path: Path, _ownership_marker: str):
+            contender = {
+                "id": 7001,
+                "name": path.name,
+                "label": None,
+                "size": path.stat().st_size,
+                "state": "uploaded",
+                "digest": f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}",
+            }
+            self.assets.append(contender)
+            return copy.deepcopy(contender)
+
+        def delete_asset(self, _release_id: int, asset_id: int) -> None:
+            self.deleted.append(asset_id)
+            self.assets = [asset for asset in self.assets if asset["id"] != asset_id]
+
+    github = FakeGitHub()
+    with pytest.raises(ReleaseContractError, match="uploaded asset mismatch"):
+        publish_assets_transactional(snapshot, manifest, dist, github)
+
+    assert github.deleted == []
+    assert [asset["id"] for asset in github.assets] == [7001]
+
+
+def test_asset_publication_preserves_unvalidated_bad_digest_contender(tmp_path) -> None:
     dist = _dist(tmp_path)
     manifest = create_manifest(dist, project=PROJECT, version=VERSION)
     snapshot = capture_snapshot(
@@ -1151,11 +1408,13 @@ def test_asset_publication_rolls_back_asset_created_with_bad_server_digest(tmp_p
             self.assets = [asset for asset in self.assets if asset["id"] != asset_id]
 
     github = FakeGitHub()
-    with pytest.raises(ReleaseContractError, match="uploaded asset mismatch"):
+    with pytest.raises(
+        ReleaseContractError, match="asset publication failed and rollback was incomplete"
+    ):
         publish_assets_transactional(snapshot, manifest, dist, github)
 
-    assert github.deleted == [(snapshot.release_id, 2), (snapshot.release_id, 1)]
-    assert github.assets == []
+    assert github.deleted == [(snapshot.release_id, 1)]
+    assert [asset["id"] for asset in github.assets] == [2]
 
 
 def test_asset_conflict_preflight_finishes_before_first_mutation(tmp_path) -> None:
@@ -1216,6 +1475,11 @@ def test_asset_publication_is_sequential_and_recaptures_before_each_post(tmp_pat
             self.events.append("recapture")
             return _ref(), _release(assets=copy.deepcopy(self.assets))
 
+        def recapture_artifact(self, artifact_id: int):
+            assert artifact_id == ARTIFACT_ID
+            self.events.append("artifact")
+            return _artifact_metadata()
+
         def upload_asset(
             self, release_id: int, path: Path, ownership_marker: str
         ) -> dict[str, object]:
@@ -1236,15 +1500,83 @@ def test_asset_publication_is_sequential_and_recaptures_before_each_post(tmp_pat
             raise AssertionError("successful publication must not roll back")
 
     github = FakeGitHub()
-    publish_assets_transactional(snapshot, manifest, dist, github)
+    publish_assets_transactional(
+        snapshot,
+        manifest,
+        dist,
+        github,
+        artifact_binding=_artifact_binding(),
+    )
     assert github.events == [
         "recapture",
+        "artifact",
         "recapture",
         "upload:dcc_mcp_material_maker-0.4.1-py3-none-any.whl",
         "recapture",
+        "artifact",
+        "recapture",
         "upload:dcc_mcp_material_maker-0.4.1.tar.gz",
         "recapture",
+        "recapture",
     ]
+
+
+def test_artifact_provenance_drift_before_next_post_rolls_back_only_owned_assets(
+    tmp_path,
+) -> None:
+    dist = _dist(tmp_path)
+    manifest = create_manifest(dist, project=PROJECT, version=VERSION)
+    snapshot = capture_snapshot(
+        repository="dcc-mcp/dcc-mcp-material-maker",
+        tag=TAG,
+        source_sha=SHA,
+        ref_payload=_ref(),
+        release_payload=_release(),
+    )
+
+    class FakeGitHub:
+        def __init__(self) -> None:
+            self.assets: list[dict[str, object]] = []
+            self.uploads = 0
+            self.artifact_recaptures = 0
+            self.deleted: list[int] = []
+
+        def recapture_artifact(self, artifact_id: int):
+            assert artifact_id == ARTIFACT_ID
+            self.artifact_recaptures += 1
+            metadata = _artifact_metadata()
+            if self.artifact_recaptures == 2:
+                metadata["digest"] = "sha256:" + "0" * 64
+            return metadata
+
+        def recapture_release(self, _snapshot):
+            return _ref(), _release(assets=copy.deepcopy(self.assets))
+
+        def upload_asset(self, _release_id: int, path: Path, ownership_marker: str):
+            self.uploads += 1
+            asset = {
+                "id": self.uploads,
+                "name": path.name,
+                "label": ownership_marker,
+                "size": path.stat().st_size,
+                "state": "uploaded",
+                "digest": f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}",
+            }
+            self.assets.append(asset)
+            return copy.deepcopy(asset)
+
+        def delete_asset(self, _release_id: int, asset_id: int) -> None:
+            self.deleted.append(asset_id)
+            self.assets = [asset for asset in self.assets if asset["id"] != asset_id]
+
+    github = FakeGitHub()
+    with pytest.raises(ReleaseContractError, match="artifact digest drift"):
+        publish_assets_transactional(snapshot, manifest, dist, github)
+
+    assert github.artifact_recaptures == 2
+    assert github.uploads == 1
+    assert github.deleted == [1]
+    assert github.assets == []
 
 
 def test_asset_publication_recovers_ambiguous_post_timeout_without_partial_assets(
@@ -1551,7 +1883,7 @@ def test_rollback_preserves_identity_drift_and_continues_other_owned_assets(
         def recapture_release(self, _snapshot):
             self.recaptures += 1
             payload = _release(assets=copy.deepcopy(self.assets))
-            if self.recaptures == 4:
+            if self.recaptures == 6:
                 self.assets[1][field] = replacement
                 payload = _release(
                     assets=copy.deepcopy(self.assets),
