@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import stat
+import struct
 import tarfile
 import zipfile
 from datetime import datetime, timezone
@@ -95,6 +96,64 @@ def _dist(tmp_path):
     _write_wheel(wheel)
     _write_sdist(sdist)
     return dist
+
+
+def _append_archive_members(dist: Path, kind: str, paths: list[str]) -> None:
+    if kind == "wheel":
+        wheel = dist / "dcc_mcp_material_maker-0.4.1-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "a") as archive:
+            for index, name in enumerate(paths):
+                archive.writestr(name, f"payload-{index}".encode())
+        return
+
+    sdist = dist / "dcc_mcp_material_maker-0.4.1.tar.gz"
+    root = "dcc_mcp_material_maker-0.4.1"
+    metadata = _metadata()
+    metadata_member = tarfile.TarInfo(f"{root}/PKG-INFO")
+    metadata_member.size = len(metadata)
+    with tarfile.open(sdist, "w:gz") as archive:
+        archive.addfile(metadata_member, io.BytesIO(metadata))
+        for index, name in enumerate(paths):
+            payload = f"payload-{index}".encode()
+            member = tarfile.TarInfo(f"{root}/{name}")
+            member.size = len(payload)
+            archive.addfile(member, io.BytesIO(payload))
+
+
+def _write_current_dist_manifest(dist: Path, manifest_path: Path) -> str:
+    manifest = {
+        "schema_version": 1,
+        "project": PROJECT,
+        "version": VERSION,
+        "artifacts": [
+            {
+                "filename": path.name,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "size": path.stat().st_size,
+            }
+            for path in sorted(dist.iterdir(), key=lambda item: item.name)
+        ],
+    }
+    return write_manifest(manifest, manifest_path)
+
+
+def _corrupt_non_metadata_wheel_member(wheel: Path, corruption: str) -> None:
+    member_name = "dcc_mcp_material_maker/payload.bin"
+    with zipfile.ZipFile(wheel, "a") as archive:
+        archive.writestr(member_name, b"non-metadata-payload")
+    with zipfile.ZipFile(wheel) as archive:
+        info = archive.getinfo(member_name)
+
+    raw = bytearray(wheel.read_bytes())
+    if corruption == "payload-crc":
+        name_length, extra_length = struct.unpack_from("<HH", raw, info.header_offset + 26)
+        data_offset = info.header_offset + 30 + name_length + extra_length
+        raw[data_offset] ^= 0x01
+    elif corruption == "local-size":
+        struct.pack_into("<I", raw, info.header_offset + 22, info.file_size + 1)
+    else:  # pragma: no cover - test helper contract
+        raise AssertionError(f"unknown corruption: {corruption}")
+    wheel.write_bytes(raw)
 
 
 def test_manifest_binds_exact_wheel_and_sdist_bytes(tmp_path) -> None:
@@ -358,6 +417,159 @@ def test_manifest_rejects_unsafe_archive_paths(tmp_path, unsafe_path: str) -> No
 
     with pytest.raises(ReleaseContractError, match="distribution archive mismatch"):
         create_manifest(dist, project=PROJECT, version=VERSION)
+
+
+@pytest.mark.parametrize("phase", ["create", "verify"])
+@pytest.mark.parametrize("kind", ["wheel", "sdist"])
+@pytest.mark.parametrize(
+    "paths",
+    [
+        ["pkg/caf\u00e9.txt", "pkg/cafe\u0301.txt"],
+        ["pkg/File.txt", "pkg/file.txt"],
+        ["pkg/STRASSE.txt", "pkg/stra\u00dfe.txt"],
+        ["pkg/\u212a.txt", "pkg/k.txt"],
+        ["pkg/name", "pkg/name."],
+        ["pkg/name", "pkg/name "],
+        ["pkg/CON"],
+        ["pkg/com1.txt"],
+        ["pkg/file.txt:stream"],
+        ["pkg/bad?.txt"],
+        ["pkg/parent", "pkg/parent/child.txt"],
+        ["pkg/parent/child.txt", "pkg/parent"],
+    ],
+    ids=[
+        "unicode-composition-alias",
+        "case-alias",
+        "casefold-alias",
+        "compatibility-alias",
+        "trailing-dot-alias",
+        "trailing-space-alias",
+        "reserved-name",
+        "device-name-with-extension",
+        "alternate-data-stream",
+        "windows-forbidden-character",
+        "file-before-child",
+        "child-before-file",
+    ],
+)
+def test_archive_member_portability_and_topology_are_enforced_in_both_phases(
+    tmp_path, phase: str, kind: str, paths: list[str]
+) -> None:
+    dist = _dist(tmp_path)
+    _append_archive_members(dist, kind, paths)
+
+    with pytest.raises(ReleaseContractError, match="distribution archive mismatch"):
+        if phase == "create":
+            create_manifest(dist, project=PROJECT, version=VERSION)
+        else:
+            manifest_path = tmp_path / "manifest.json"
+            manifest_sha256 = _write_current_dist_manifest(dist, manifest_path)
+            verify_manifest(manifest_path, dist, manifest_sha256)
+
+
+@pytest.mark.parametrize("kind", ["wheel", "sdist"])
+def test_archive_explicit_directory_with_child_is_valid(tmp_path, kind: str) -> None:
+    dist = _dist(tmp_path)
+    if kind == "wheel":
+        wheel = dist / "dcc_mcp_material_maker-0.4.1-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "a") as archive:
+            archive.writestr("pkg/parent/", b"")
+            archive.writestr("pkg/parent/child.txt", b"child")
+    else:
+        sdist = dist / "dcc_mcp_material_maker-0.4.1.tar.gz"
+        root = "dcc_mcp_material_maker-0.4.1"
+        metadata = _metadata()
+        metadata_member = tarfile.TarInfo(f"{root}/PKG-INFO")
+        metadata_member.size = len(metadata)
+        directory = tarfile.TarInfo(f"{root}/pkg/parent/")
+        directory.type = tarfile.DIRTYPE
+        child = tarfile.TarInfo(f"{root}/pkg/parent/child.txt")
+        child.size = len(b"child")
+        with tarfile.open(sdist, "w:gz") as archive:
+            archive.addfile(metadata_member, io.BytesIO(metadata))
+            archive.addfile(directory)
+            archive.addfile(child, io.BytesIO(b"child"))
+
+    manifest = create_manifest(dist, project=PROJECT, version=VERSION)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_sha256 = write_manifest(manifest, manifest_path)
+    assert verify_manifest(manifest_path, dist, manifest_sha256) == manifest
+
+
+@pytest.mark.parametrize("phase", ["create", "verify"])
+@pytest.mark.parametrize("kind", ["wheel", "sdist"])
+def test_archive_rejects_normalized_file_directory_aliases(tmp_path, phase: str, kind: str) -> None:
+    dist = _dist(tmp_path)
+    if kind == "wheel":
+        wheel = dist / "dcc_mcp_material_maker-0.4.1-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "a") as archive:
+            archive.writestr("pkg/FOLDER/", b"")
+            archive.writestr("pkg/folder", b"file")
+    else:
+        sdist = dist / "dcc_mcp_material_maker-0.4.1.tar.gz"
+        root = "dcc_mcp_material_maker-0.4.1"
+        metadata = _metadata()
+        metadata_member = tarfile.TarInfo(f"{root}/PKG-INFO")
+        metadata_member.size = len(metadata)
+        directory = tarfile.TarInfo(f"{root}/pkg/FOLDER/")
+        directory.type = tarfile.DIRTYPE
+        file_member = tarfile.TarInfo(f"{root}/pkg/folder")
+        file_member.size = len(b"file")
+        with tarfile.open(sdist, "w:gz") as archive:
+            archive.addfile(metadata_member, io.BytesIO(metadata))
+            archive.addfile(directory)
+            archive.addfile(file_member, io.BytesIO(b"file"))
+
+    with pytest.raises(ReleaseContractError, match="distribution archive mismatch"):
+        if phase == "create":
+            create_manifest(dist, project=PROJECT, version=VERSION)
+        else:
+            manifest_path = tmp_path / "manifest.json"
+            manifest_sha256 = _write_current_dist_manifest(dist, manifest_path)
+            verify_manifest(manifest_path, dist, manifest_sha256)
+
+
+@pytest.mark.parametrize("phase", ["create", "verify"])
+@pytest.mark.parametrize("corruption", ["payload-crc", "local-size"])
+def test_wheel_validation_reads_and_checks_every_regular_member(
+    tmp_path, phase: str, corruption: str
+) -> None:
+    dist = _dist(tmp_path)
+    wheel = dist / "dcc_mcp_material_maker-0.4.1-py3-none-any.whl"
+    _corrupt_non_metadata_wheel_member(wheel, corruption)
+
+    with pytest.raises(ReleaseContractError, match="distribution archive mismatch"):
+        if phase == "create":
+            create_manifest(dist, project=PROJECT, version=VERSION)
+        else:
+            manifest_path = tmp_path / "manifest.json"
+            manifest_sha256 = _write_current_dist_manifest(dist, manifest_path)
+            verify_manifest(manifest_path, dist, manifest_sha256)
+
+
+@pytest.mark.parametrize("phase", ["create", "verify"])
+def test_sdist_validation_reads_every_regular_member(tmp_path, monkeypatch, phase: str) -> None:
+    dist = _dist(tmp_path)
+    _append_archive_members(dist, "sdist", ["pkg/payload.bin"])
+    extracted: list[str] = []
+    original_extractfile = tarfile.TarFile.extractfile
+
+    def recording_extractfile(archive, member):
+        extracted.append(member.name)
+        return original_extractfile(archive, member)
+
+    monkeypatch.setattr(tarfile.TarFile, "extractfile", recording_extractfile)
+    if phase == "create":
+        create_manifest(dist, project=PROJECT, version=VERSION)
+    else:
+        manifest_path = tmp_path / "manifest.json"
+        manifest_sha256 = _write_current_dist_manifest(dist, manifest_path)
+        verify_manifest(manifest_path, dist, manifest_sha256)
+
+    assert extracted == [
+        "dcc_mcp_material_maker-0.4.1/PKG-INFO",
+        "dcc_mcp_material_maker-0.4.1/pkg/payload.bin",
+    ]
 
 
 def test_manifest_rejects_nul_in_raw_wheel_member_name(tmp_path) -> None:
@@ -1083,7 +1295,9 @@ def test_asset_publication_recovers_ambiguous_post_timeout_without_partial_asset
     assert github.assets == []
 
 
-def test_lost_post_response_uses_transaction_marker_and_preserves_contender(tmp_path) -> None:
+def test_lost_post_response_preserves_all_same_marker_candidates_when_ambiguous(
+    tmp_path,
+) -> None:
     dist = _dist(tmp_path)
     manifest = create_manifest(dist, project=PROJECT, version=VERSION)
     snapshot = capture_snapshot(
@@ -1125,8 +1339,8 @@ def test_lost_post_response_uses_transaction_marker_and_preserves_contender(tmp_
             self.assets.extend(
                 [
                     self.make_asset(path, 2, ownership_marker),
-                    self.make_asset(path, 3, ownership_marker),
-                    self.make_asset(path, 99, "another-transaction"),
+                    self.make_asset(path, 99, ownership_marker),
+                    self.make_asset(path, 100, "another-transaction"),
                 ]
             )
             raise TimeoutError("POST response lost after multiple server commits")
@@ -1136,16 +1350,21 @@ def test_lost_post_response_uses_transaction_marker_and_preserves_contender(tmp_
             self.assets = [asset for asset in self.assets if asset["id"] != asset_id]
 
     github = FakeGitHub()
-    with pytest.raises(ReleaseContractError, match="GitHub asset publication failed"):
+    with pytest.raises(
+        ReleaseContractError, match="asset publication failed and rollback was incomplete"
+    ):
         publish_assets_transactional(snapshot, manifest, dist, github)
 
     assert len(github.markers) == 2
     assert github.markers[0] != github.markers[1]
-    assert set(github.deleted) == {1, 2, 3}
-    assert [asset["id"] for asset in github.assets] == [99]
+    assert github.deleted == [1]
+    assert [asset["id"] for asset in github.assets] == [2, 99, 100]
+    assert set(github.deleted).isdisjoint({2, 99})
 
 
-def test_lost_post_response_cleans_exact_candidate_despite_same_marker_drift(tmp_path) -> None:
+def test_lost_post_response_preserves_exact_and_drifted_same_marker_candidates(
+    tmp_path,
+) -> None:
     dist = _dist(tmp_path)
     manifest = create_manifest(dist, project=PROJECT, version=VERSION)
     snapshot = capture_snapshot(
@@ -1197,8 +1416,8 @@ def test_lost_post_response_cleans_exact_candidate_despite_same_marker_drift(tmp
     ):
         publish_assets_transactional(snapshot, manifest, dist, github)
 
-    assert set(github.deleted) == {1, 2}
-    assert [asset["id"] for asset in github.assets] == [3]
+    assert github.deleted == [1]
+    assert [asset["id"] for asset in github.assets] == [2, 3]
 
 
 def test_lost_post_response_retries_pending_asset_recapture(tmp_path) -> None:
