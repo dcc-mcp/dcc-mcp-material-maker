@@ -14,14 +14,17 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 import subprocess
 import sys
 import tarfile
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from email.parser import BytesParser
 from pathlib import Path
@@ -34,6 +37,12 @@ TAG_RE = re.compile(
     r"^v(?P<version>0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
     r"(?:[-+][0-9A-Za-z.-]+)?$"
 )
+ARCHIVE_MAX_MEMBERS = 10_000
+ARCHIVE_MAX_METADATA_SIZE = 1024 * 1024
+ARCHIVE_MAX_MEMBER_SIZE = 16 * 1024 * 1024
+ARCHIVE_MAX_TOTAL_SIZE = 64 * 1024 * 1024
+ARCHIVE_MAX_COMPRESSION_RATIO = 100
+ROLLBACK_MAX_ATTEMPTS = 3
 
 
 class ReleaseContractError(RuntimeError):
@@ -166,38 +175,158 @@ def _validate_metadata(payload: bytes, *, project: str, version: str) -> None:
         raise ReleaseContractError("distribution metadata mismatch")
 
 
+def _validate_archive_path(name: str) -> None:
+    canonical = name[:-1] if name.endswith("/") else name
+    parts = canonical.split("/")
+    if (
+        not canonical
+        or name.startswith("/")
+        or "\\" in name
+        or re.match(r"^[A-Za-z]:", name)
+        or any(unicodedata.category(character) == "Cc" for character in name)
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        raise ReleaseContractError("distribution archive mismatch")
+
+
+@dataclasses.dataclass(frozen=True)
+class _ArchiveMember:
+    path: str
+    size: int
+    compressed_size: int | None
+    is_file: bool
+    is_dir: bool
+    source: object
+
+
+def _validate_archive_members(
+    members: Iterable[_ArchiveMember],
+    *,
+    archive_size: int,
+    expected_metadata: str,
+    metadata_basename: str,
+    expected_root: str,
+    require_single_root: bool,
+    reserved_root_suffix: str | None = None,
+) -> object:
+    """Validate every archive member before returning the unique metadata member."""
+
+    if archive_size <= 0:
+        raise ReleaseContractError("distribution archive mismatch")
+    seen_paths: set[str] = set()
+    metadata_members: list[_ArchiveMember] = []
+    total_size = 0
+    member_count = 0
+    for member in members:
+        member_count += 1
+        if member_count > ARCHIVE_MAX_MEMBERS:
+            raise ReleaseContractError("distribution archive mismatch")
+        _validate_archive_path(member.path)
+        canonical_path = member.path.rstrip("/")
+        if canonical_path in seen_paths or not (member.is_file or member.is_dir):
+            raise ReleaseContractError("distribution archive mismatch")
+        seen_paths.add(canonical_path)
+
+        root = canonical_path.split("/", 1)[0]
+        if require_single_root and root != expected_root:
+            raise ReleaseContractError("distribution archive mismatch")
+        if reserved_root_suffix and root.endswith(reserved_root_suffix) and root != expected_root:
+            raise ReleaseContractError("distribution archive mismatch")
+
+        if member.size < 0 or member.size > ARCHIVE_MAX_MEMBER_SIZE:
+            raise ReleaseContractError("distribution archive mismatch")
+        if member.compressed_size is not None and (
+            member.compressed_size < 0
+            or (
+                member.size > 0
+                and (
+                    member.compressed_size == 0
+                    or member.size > member.compressed_size * ARCHIVE_MAX_COMPRESSION_RATIO
+                )
+            )
+        ):
+            raise ReleaseContractError("distribution archive mismatch")
+        total_size += member.size
+        if total_size > ARCHIVE_MAX_TOTAL_SIZE:
+            raise ReleaseContractError("distribution archive mismatch")
+        if canonical_path.rsplit("/", 1)[-1] == metadata_basename:
+            metadata_members.append(member)
+
+    if member_count == 0 or total_size > archive_size * ARCHIVE_MAX_COMPRESSION_RATIO:
+        raise ReleaseContractError("distribution archive mismatch")
+    if (
+        len(metadata_members) != 1
+        or metadata_members[0].path != expected_metadata
+        or not metadata_members[0].is_file
+        or metadata_members[0].size > ARCHIVE_MAX_METADATA_SIZE
+    ):
+        raise ReleaseContractError("distribution archive mismatch")
+    return metadata_members[0].source
+
+
+def _wheel_member(info: zipfile.ZipInfo) -> _ArchiveMember:
+    mode_type = stat.S_IFMT(info.external_attr >> 16)
+    is_dir = info.is_dir() and mode_type in {0, stat.S_IFDIR}
+    is_file = not info.is_dir() and mode_type in {0, stat.S_IFREG}
+    return _ArchiveMember(
+        path=info.orig_filename,
+        size=info.file_size,
+        compressed_size=info.compress_size,
+        is_file=is_file,
+        is_dir=is_dir,
+        source=info,
+    )
+
+
 def _validate_wheel_metadata(path: Path, *, project: str, version: str) -> None:
+    expected_root = f"{_normalized_distribution_name(project)}-{version}.dist-info"
+    expected_metadata = f"{expected_root}/METADATA"
     try:
         with zipfile.ZipFile(path) as archive:
-            metadata = [
-                info
-                for info in archive.infolist()
-                if re.fullmatch(r"[^/]+\.dist-info/METADATA", info.filename)
-            ]
-            if len(metadata) != 1 or metadata[0].is_dir():
-                raise ReleaseContractError("distribution metadata mismatch")
-            payload = archive.read(metadata[0])
-    except (OSError, KeyError, zipfile.BadZipFile) as error:
-        raise ReleaseContractError("distribution metadata mismatch") from error
+            metadata = _validate_archive_members(
+                (_wheel_member(info) for info in archive.infolist()),
+                archive_size=path.stat().st_size,
+                expected_metadata=expected_metadata,
+                metadata_basename="METADATA",
+                expected_root=expected_root,
+                require_single_root=False,
+                reserved_root_suffix=".dist-info",
+            )
+            payload = archive.read(metadata)
+    except (OSError, KeyError, RuntimeError, NotImplementedError, zipfile.BadZipFile) as error:
+        raise ReleaseContractError("distribution archive mismatch") from error
     _validate_metadata(payload, project=project, version=version)
 
 
 def _validate_sdist_metadata(path: Path, *, project: str, version: str) -> None:
+    expected_root = f"{_normalized_distribution_name(project)}-{version}"
+    expected_metadata = f"{expected_root}/PKG-INFO"
     try:
         with tarfile.open(path, "r:gz") as archive:
-            metadata = [
-                member
-                for member in archive.getmembers()
-                if re.fullmatch(r"[^/]+/PKG-INFO", member.name)
-            ]
-            if len(metadata) != 1 or not metadata[0].isfile():
-                raise ReleaseContractError("distribution metadata mismatch")
-            handle = archive.extractfile(metadata[0])
+            metadata = _validate_archive_members(
+                (
+                    _ArchiveMember(
+                        path=member.name,
+                        size=member.size,
+                        compressed_size=None,
+                        is_file=member.isfile(),
+                        is_dir=member.isdir(),
+                        source=member,
+                    )
+                    for member in archive
+                ),
+                archive_size=path.stat().st_size,
+                expected_metadata=expected_metadata,
+                metadata_basename="PKG-INFO",
+                expected_root=expected_root,
+                require_single_root=True,
+            )
+            handle = archive.extractfile(metadata)
             if handle is None:
                 raise ReleaseContractError("distribution metadata mismatch")
-            payload = handle.read(1024 * 1024 + 1)
+            payload = handle.read(ARCHIVE_MAX_METADATA_SIZE + 1)
     except (OSError, EOFError, tarfile.TarError) as error:
-        raise ReleaseContractError("distribution metadata mismatch") from error
+        raise ReleaseContractError("distribution archive mismatch") from error
     _validate_metadata(payload, project=project, version=version)
 
 
@@ -479,7 +608,7 @@ def _assert_transaction_assets(
 
 
 def _validate_uploaded_asset(
-    asset: dict[str, object], expected: dict[str, object]
+    asset: dict[str, object], expected: dict[str, object], ownership_marker: str
 ) -> dict[str, object]:
     if (
         type(asset.get("id")) is not int
@@ -488,6 +617,7 @@ def _validate_uploaded_asset(
         or asset.get("size") != expected.get("size")
         or asset.get("state") != "uploaded"
         or asset.get("digest") != f"sha256:{expected.get('sha256')}"
+        or asset.get("label") != ownership_marker
     ):
         raise ReleaseContractError(f"uploaded asset mismatch: {expected.get('filename')}")
     return asset
@@ -496,10 +626,21 @@ def _validate_uploaded_asset(
 def _record_uploaded_asset(asset: dict[str, object]) -> dict[str, object]:
     if type(asset.get("id")) is not int or asset["id"] <= 0:
         raise ReleaseContractError("uploaded asset identity is missing")
-    return asset
+    return dict(asset)
 
 
-def _asset_matches_expected(asset: object, expected: dict[str, object]) -> bool:
+_OWNED_ASSET_IDENTITY_FIELDS = ("id", "name", "label", "size", "state", "digest")
+
+
+def _asset_identity_matches(current: object, recorded: dict[str, object]) -> bool:
+    return isinstance(current, dict) and all(
+        current.get(field) == recorded.get(field) for field in _OWNED_ASSET_IDENTITY_FIELDS
+    )
+
+
+def _asset_matches_expected(
+    asset: object, expected: dict[str, object], ownership_marker: str
+) -> bool:
     return (
         isinstance(asset, dict)
         and type(asset.get("id")) is int
@@ -508,7 +649,143 @@ def _asset_matches_expected(asset: object, expected: dict[str, object]) -> bool:
         and asset.get("size") == expected.get("size")
         and asset.get("state") == "uploaded"
         and asset.get("digest") == f"sha256:{expected.get('sha256')}"
+        and asset.get("label") == ownership_marker
     )
+
+
+def _ownership_marker(transaction_id: str, index: int, expected: dict[str, object]) -> str:
+    digest = expected.get("sha256")
+    if not re.fullmatch(r"[0-9a-f]{32}", transaction_id) or not SHA256_RE.fullmatch(str(digest)):
+        raise ReleaseContractError("invalid asset ownership marker")
+    return f"dcc-mcp-tx-{transaction_id}-{index}-{str(digest)[:12]}"
+
+
+def _recapture_release_assets(snapshot: ReleaseSnapshot, github: Any) -> list[object]:
+    ref_payload, release_payload = github.recapture_release(snapshot)
+    verify_snapshot(
+        snapshot,
+        ref_payload=ref_payload,
+        release_payload=release_payload,
+        expect_no_assets=False,
+    )
+    assets = release_payload.get("assets")
+    if not isinstance(assets, list):
+        raise ReleaseContractError("release asset set drift")
+    return assets
+
+
+def _discover_pending_assets(
+    snapshot: ReleaseSnapshot,
+    github: Any,
+    expected: dict[str, object],
+    ownership_marker: str,
+    known_ids: set[int],
+) -> tuple[list[dict[str, object]], bool]:
+    """Recover exact marker-bound POST results; preserve any drifted contender."""
+
+    recovered: dict[int, dict[str, object]] = {}
+    complete = True
+    saw_successful_recapture = False
+    for _ in range(ROLLBACK_MAX_ATTEMPTS):
+        try:
+            current_assets = _recapture_release_assets(snapshot, github)
+        except Exception:
+            continue
+        saw_successful_recapture = True
+        marker_assets = [
+            asset
+            for asset in current_assets
+            if isinstance(asset, dict)
+            and asset.get("id") not in known_ids
+            and asset.get("label") == ownership_marker
+        ]
+        for asset in marker_assets:
+            if not _asset_matches_expected(asset, expected, ownership_marker):
+                complete = False
+                continue
+            recorded = _record_uploaded_asset(asset)
+            asset_id = recorded["id"]
+            previous = recovered.get(asset_id)
+            if previous is not None and not _asset_identity_matches(recorded, previous):
+                complete = False
+                continue
+            recovered[asset_id] = recorded
+    return list(recovered.values()), complete and saw_successful_recapture
+
+
+def _rollback_owned_asset(
+    snapshot: ReleaseSnapshot, github: Any, recorded: dict[str, object]
+) -> bool:
+    """Delete one exact owned identity with bounded ambiguous-failure recovery."""
+
+    for _ in range(ROLLBACK_MAX_ATTEMPTS):
+        try:
+            current_assets = _recapture_release_assets(snapshot, github)
+        except Exception:
+            continue
+        matches = [
+            current
+            for current in current_assets
+            if isinstance(current, dict) and current.get("id") == recorded["id"]
+        ]
+        if not matches:
+            return True
+        if len(matches) != 1 or not _asset_identity_matches(matches[0], recorded):
+            return False
+        try:
+            github.delete_asset(snapshot.release_id, recorded["id"])
+            after_delete = _recapture_release_assets(snapshot, github)
+        except Exception:
+            continue
+        remaining = [
+            current
+            for current in after_delete
+            if isinstance(current, dict) and current.get("id") == recorded["id"]
+        ]
+        if not remaining:
+            return True
+        if len(remaining) != 1 or not _asset_identity_matches(remaining[0], recorded):
+            return False
+    return False
+
+
+def _rollback_transaction_assets(
+    snapshot: ReleaseSnapshot,
+    github: Any,
+    uploaded: list[dict[str, object]],
+    pending: tuple[dict[str, object], str] | None,
+    ownership_markers: set[str],
+) -> bool:
+    """Recover every independently confirmed owned upload without touching contenders."""
+
+    owned = list(uploaded)
+    complete = True
+    if pending is not None:
+        pending_artifact, pending_marker = pending
+        recovered, discovery_complete = _discover_pending_assets(
+            snapshot,
+            github,
+            pending_artifact,
+            pending_marker,
+            {asset["id"] for asset in owned},
+        )
+        owned.extend(recovered)
+        complete = discovery_complete
+
+    for asset in reversed(owned):
+        if not _rollback_owned_asset(snapshot, github, asset):
+            complete = False
+
+    try:
+        remaining_assets = _recapture_release_assets(snapshot, github)
+    except Exception:
+        return False
+    if any(
+        isinstance(asset, dict) and asset.get("label") in ownership_markers
+        for asset in remaining_assets
+    ):
+        complete = False
+    return complete
 
 
 def _parse_github_time(value: object, *, label: str) -> datetime:
@@ -606,9 +883,11 @@ def publish_assets_transactional(
     )
 
     uploaded: list[dict[str, object]] = []
-    pending: dict[str, object] | None = None
+    transaction_id = secrets.token_hex(16)
+    ownership_markers: set[str] = set()
+    pending: tuple[dict[str, object], str] | None = None
     try:
-        for filename, artifact in expected.items():
+        for index, (filename, artifact) in enumerate(expected.items(), start=1):
             pending = None
             ref_payload, release_payload = github.recapture_release(snapshot)
             verify_snapshot(
@@ -618,10 +897,12 @@ def publish_assets_transactional(
                 expect_no_assets=not uploaded,
             )
             _assert_transaction_assets(release_payload, uploaded)
-            pending = artifact
-            response = github.upload_asset(snapshot.release_id, dist_dir / filename)
+            marker = _ownership_marker(transaction_id, index, artifact)
+            ownership_markers.add(marker)
+            pending = (artifact, marker)
+            response = github.upload_asset(snapshot.release_id, dist_dir / filename, marker)
             uploaded.append(_record_uploaded_asset(response))
-            _validate_uploaded_asset(response, artifact)
+            _validate_uploaded_asset(response, artifact, marker)
             pending = None
 
         ref_payload, release_payload = github.recapture_release(snapshot)
@@ -633,52 +914,10 @@ def publish_assets_transactional(
         )
     except Exception as error:
         try:
-            if pending is not None:
-                ref_payload, release_payload = github.recapture_release(snapshot)
-                verify_snapshot(
-                    snapshot,
-                    ref_payload=ref_payload,
-                    release_payload=release_payload,
-                    expect_no_assets=False,
-                )
-                current_assets = release_payload.get("assets")
-                if not isinstance(current_assets, list):
-                    raise ReleaseContractError("release asset set drift")
-                known_ids = {asset["id"] for asset in uploaded}
-                candidates = [
-                    asset
-                    for asset in current_assets
-                    if isinstance(asset, dict)
-                    and asset.get("id") not in known_ids
-                    and _asset_matches_expected(asset, pending)
-                ]
-                if len(candidates) > 1:
-                    raise ReleaseContractError("ambiguous transaction asset identity")
-                if candidates:
-                    uploaded.append(candidates[0])
-            for asset in reversed(uploaded):
-                ref_payload, release_payload = github.recapture_release(snapshot)
-                verify_snapshot(
-                    snapshot,
-                    ref_payload=ref_payload,
-                    release_payload=release_payload,
-                    expect_no_assets=False,
-                )
-                current_assets = release_payload.get("assets")
-                if not isinstance(current_assets, list) or not any(
-                    isinstance(current, dict) and current.get("id") == asset["id"]
-                    for current in current_assets
-                ):
-                    raise ReleaseContractError("transaction asset identity drift")
-                github.delete_asset(snapshot.release_id, asset["id"])
-                uploaded.remove(asset)
-            ref_payload, release_payload = github.recapture_release(snapshot)
-            verify_snapshot(
-                snapshot,
-                ref_payload=ref_payload,
-                release_payload=release_payload,
-                expect_no_assets=True,
-            )
+            if not _rollback_transaction_assets(
+                snapshot, github, uploaded, pending, ownership_markers
+            ):
+                raise ReleaseContractError("asset rollback retry exhausted")
         except Exception as rollback_error:
             raise ReleaseContractError(
                 "asset publication failed and rollback was incomplete"
@@ -742,15 +981,17 @@ class GitHubReleaseClient:
         url = f"https://api.github.com/repos/{self.repository}/actions/artifacts/{artifact_id}"
         return self._json_request(url)
 
-    def upload_asset(self, release_id: int, path: Path) -> dict[str, object]:
+    def upload_asset(self, release_id: int, path: Path, ownership_marker: str) -> dict[str, object]:
         if type(release_id) is not int or release_id <= 0:
             raise ReleaseContractError("invalid release identity")
         if not path.is_file() or _is_link_or_reparse(path):
             raise ReleaseContractError("distribution asset is missing or unsafe")
-        encoded_name = urllib.parse.quote(path.name, safe="")
+        if not re.fullmatch(r"dcc-mcp-tx-[0-9a-f]{32}-\d+-[0-9a-f]{12}", ownership_marker):
+            raise ReleaseContractError("invalid asset ownership marker")
+        query = urllib.parse.urlencode({"name": path.name, "label": ownership_marker})
         url = (
             f"https://uploads.github.com/repos/{self.repository}/releases/"
-            f"{release_id}/assets?name={encoded_name}"
+            f"{release_id}/assets?{query}"
         )
         return self._json_request(
             url,
