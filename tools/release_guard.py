@@ -380,7 +380,7 @@ def _wheel_end_record(handle: Any, archive_size: int) -> tuple[int, tuple[object
     raise ReleaseContractError("distribution archive mismatch")
 
 
-def _preflight_wheel_raw_names(path: Path) -> list[tuple[str, int]]:
+def _preflight_wheel_raw_names(path: Path) -> list[tuple[str, int, int]]:
     archive_size = path.stat().st_size
     if archive_size < 22:
         raise ReleaseContractError("distribution archive mismatch")
@@ -415,6 +415,8 @@ def _preflight_wheel_raw_names(path: Path) -> list[tuple[str, int]]:
                 if (
                     fields[0] != b"PK\x01\x02"
                     or fields[13] != 0
+                    or fields[8] == 0xFFFFFFFF
+                    or fields[9] == 0xFFFFFFFF
                     or fields[16] == 0xFFFFFFFF
                     or len(raw_name) != name_length
                     or len(extra) != extra_length
@@ -425,6 +427,19 @@ def _preflight_wheel_raw_names(path: Path) -> list[tuple[str, int]]:
             if handle.tell() != central_offset + central_size:
                 raise ReleaseContractError("distribution archive mismatch")
 
+            local_offsets = sorted(local_offset for _, local_offset in members)
+            if (
+                len(set(local_offsets)) != len(local_offsets)
+                or not local_offsets
+                or local_offsets[-1] >= central_offset
+            ):
+                raise ReleaseContractError("distribution archive mismatch")
+            record_ends = {
+                local_offset: (
+                    local_offsets[index + 1] if index + 1 < len(local_offsets) else central_offset
+                )
+                for index, local_offset in enumerate(local_offsets)
+            }
             for decoded_name, local_offset in members:
                 handle.seek(local_offset)
                 fixed = handle.read(30)
@@ -441,24 +456,55 @@ def _preflight_wheel_raw_names(path: Path) -> list[tuple[str, int]]:
                 ):
                     raise ReleaseContractError("distribution archive mismatch")
                 _strict_utf8_archive_name(raw_name, decoded_name)
-            return members
+            return [
+                (decoded_name, local_offset, record_ends[local_offset])
+                for decoded_name, local_offset in members
+            ]
     except (OSError, struct.error) as error:
         raise ReleaseContractError("distribution archive mismatch") from error
 
 
 def _bind_wheel_raw_names(
-    archive: zipfile.ZipFile, raw_members: list[tuple[str, int]]
+    archive: zipfile.ZipFile, raw_members: list[tuple[str, int, int]]
 ) -> list[zipfile.ZipInfo]:
     infos = archive.infolist()
     if len(infos) != len(raw_members):
         raise ReleaseContractError("distribution archive mismatch")
-    for info, (raw_name, local_offset) in zip(infos, raw_members):
+    for info, (raw_name, local_offset, _record_end) in zip(infos, raw_members):
         if info.orig_filename != raw_name or info.header_offset != local_offset:
             raise ReleaseContractError("distribution archive mismatch")
     return infos
 
 
-def _validate_wheel_local_header(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> None:
+def _validate_wheel_data_descriptor(
+    handle: Any,
+    info: zipfile.ZipInfo,
+    *,
+    descriptor_offset: int,
+    record_end: int,
+) -> None:
+    descriptor_size = record_end - descriptor_offset
+    if descriptor_size not in {12, 16}:
+        raise ReleaseContractError("distribution archive mismatch")
+    handle.seek(descriptor_offset)
+    descriptor = handle.read(descriptor_size)
+    if len(descriptor) != descriptor_size:
+        raise ReleaseContractError("distribution archive mismatch")
+    if descriptor_size == 16:
+        if descriptor[:4] != b"PK\x07\x08":
+            raise ReleaseContractError("distribution archive mismatch")
+        values = struct.unpack("<III", descriptor[4:])
+    else:
+        if descriptor[:4] == b"PK\x07\x08":
+            raise ReleaseContractError("distribution archive mismatch")
+        values = struct.unpack("<III", descriptor)
+    if values != (info.CRC, info.compress_size, info.file_size):
+        raise ReleaseContractError("distribution archive mismatch")
+
+
+def _validate_wheel_local_header(
+    archive: zipfile.ZipFile, info: zipfile.ZipInfo, *, record_end: int
+) -> None:
     handle = archive.fp
     if handle is None:
         raise ReleaseContractError("distribution archive mismatch")
@@ -489,9 +535,15 @@ def _validate_wheel_local_header(archive: zipfile.ZipFile, info: zipfile.ZipInfo
             or len(local_extra) != extra_length
             or flags != info.flag_bits
             or compression != info.compress_type
+            or compressed_size == 0xFFFFFFFF
+            or size == 0xFFFFFFFF
         ):
             raise ReleaseContractError("distribution archive mismatch")
         _strict_utf8_archive_name(local_name, info.orig_filename)
+        data_offset = info.header_offset + 30 + name_length + extra_length
+        payload_end = data_offset + info.compress_size
+        if data_offset > payload_end or payload_end > record_end:
+            raise ReleaseContractError("distribution archive mismatch")
         uses_data_descriptor = bool(flags & 0x08)
         if uses_data_descriptor:
             if (
@@ -500,6 +552,12 @@ def _validate_wheel_local_header(archive: zipfile.ZipFile, info: zipfile.ZipInfo
                 or size not in {0, info.file_size}
             ):
                 raise ReleaseContractError("distribution archive mismatch")
+            _validate_wheel_data_descriptor(
+                handle,
+                info,
+                descriptor_offset=payload_end,
+                record_end=record_end,
+            )
         elif (crc, compressed_size, size) != (info.CRC, info.compress_size, info.file_size):
             raise ReleaseContractError("distribution archive mismatch")
     except (OSError, struct.error) as error:
@@ -539,11 +597,14 @@ def _validate_wheel_metadata(path: Path, *, project: str, version: str) -> None:
                 reserved_root_suffix=".dist-info",
             )
             payload: bytes | None = None
+            record_ends = {local_offset: record_end for _, local_offset, record_end in raw_members}
             for member in members:
                 info = member.source
                 if not isinstance(info, zipfile.ZipInfo):
                     raise ReleaseContractError("distribution archive mismatch")
-                _validate_wheel_local_header(archive, info)
+                _validate_wheel_local_header(
+                    archive, info, record_end=record_ends[info.header_offset]
+                )
                 if member.is_file:
                     with archive.open(info) as handle:
                         member_payload = _read_regular_member(

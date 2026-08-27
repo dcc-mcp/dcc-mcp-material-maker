@@ -176,6 +176,73 @@ def _write_wheel(path: Path, *, project: str = PROJECT, version: str = VERSION) 
         )
 
 
+class _UnseekableWheelSink(io.RawIOBase):
+    def __init__(self) -> None:
+        self.buffer = io.BytesIO()
+
+    def writable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return False
+
+    def write(self, data: bytes) -> int:
+        return self.buffer.write(data)
+
+    def tell(self) -> int:
+        return self.buffer.tell()
+
+    def flush(self) -> None:
+        pass
+
+
+def _write_descriptor_wheel(path: Path, descriptor: str) -> None:
+    sink = _UnseekableWheelSink()
+    with zipfile.ZipFile(sink, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            f"dcc_mcp_material_maker-{VERSION}.dist-info/METADATA",
+            _metadata(),
+        )
+
+    raw = bytearray(sink.buffer.getvalue())
+    end_offset = raw.rindex(b"PK\x05\x06")
+    central_offset = struct.unpack_from("<I", raw, end_offset + 16)[0]
+    central_header = raw.index(b"PK\x01\x02", central_offset)
+    crc, compressed_size, size = struct.unpack_from("<III", raw, central_header + 16)
+    local_header = struct.unpack_from("<I", raw, central_header + 42)[0]
+    name_length, extra_length = struct.unpack_from("<HH", raw, local_header + 26)
+    payload_offset = local_header + 30 + name_length + extra_length
+    descriptor_offset = payload_offset + compressed_size
+    assert descriptor_offset + 16 == central_offset
+    assert raw[descriptor_offset : descriptor_offset + 4] == b"PK\x07\x08"
+
+    signed = struct.pack("<4sIII", b"PK\x07\x08", crc, compressed_size, size)
+    unsigned = struct.pack("<III", crc, compressed_size, size)
+    replacements = {
+        "signed": signed,
+        "unsigned": unsigned,
+        "signed-crc": struct.pack("<4sIII", b"PK\x07\x08", crc ^ 0xFFFFFFFF, compressed_size, size),
+        "signed-compressed-size": struct.pack(
+            "<4sIII", b"PK\x07\x08", crc, compressed_size + 1, size
+        ),
+        "signed-size": struct.pack("<4sIII", b"PK\x07\x08", crc, compressed_size, size + 1),
+        "unsigned-crc": struct.pack("<III", crc ^ 0xFFFFFFFF, compressed_size, size),
+        "unsigned-compressed-size": struct.pack("<III", crc, compressed_size + 1, size),
+        "unsigned-size": struct.pack("<III", crc, compressed_size, size + 1),
+        "malformed-signature": b"BAD!" + signed[4:],
+        "ambiguous-layout": unsigned + b"JUNK",
+        "truncated": signed[:-1],
+        "zip64": struct.pack("<4sIQQ", b"PK\x07\x08", crc, compressed_size, size),
+        "zip64-unsigned": struct.pack("<IQQ", crc, compressed_size, size),
+    }
+    replacement = replacements[descriptor]
+    raw[descriptor_offset:central_offset] = replacement
+    delta = len(replacement) - 16
+    new_end_offset = end_offset + delta
+    struct.pack_into("<I", raw, new_end_offset + 16, central_offset + delta)
+    path.write_bytes(raw)
+
+
 def _write_sdist(path: Path, *, project: str = PROJECT, version: str = VERSION) -> None:
     payload = _metadata(project, version)
     member = tarfile.TarInfo(f"dcc_mcp_material_maker-{VERSION}/PKG-INFO")
@@ -751,6 +818,59 @@ def test_wheel_validation_reads_and_checks_every_regular_member(
     dist = _dist(tmp_path)
     wheel = dist / "dcc_mcp_material_maker-0.4.1-py3-none-any.whl"
     _corrupt_non_metadata_wheel_member(wheel, corruption)
+
+    with pytest.raises(ReleaseContractError, match="distribution archive mismatch"):
+        if phase == "create":
+            create_manifest(dist, project=PROJECT, version=VERSION)
+        else:
+            manifest_path = tmp_path / "manifest.json"
+            manifest_sha256 = _write_current_dist_manifest(dist, manifest_path)
+            verify_manifest(manifest_path, dist, manifest_sha256)
+
+
+@pytest.mark.parametrize("phase", ["create", "verify"])
+@pytest.mark.parametrize("descriptor", ["signed", "unsigned"])
+def test_wheel_validation_accepts_matching_data_descriptors(
+    tmp_path, phase: str, descriptor: str
+) -> None:
+    dist = _dist(tmp_path)
+    wheel = dist / "dcc_mcp_material_maker-0.4.1-py3-none-any.whl"
+    _write_descriptor_wheel(wheel, descriptor)
+
+    if phase == "create":
+        create_manifest(dist, project=PROJECT, version=VERSION)
+    else:
+        manifest_path = tmp_path / "manifest.json"
+        manifest_sha256 = _write_current_dist_manifest(dist, manifest_path)
+        verify_manifest(manifest_path, dist, manifest_sha256)
+
+
+@pytest.mark.parametrize("phase", ["create", "verify"])
+@pytest.mark.parametrize(
+    "descriptor",
+    [
+        "signed-crc",
+        "signed-compressed-size",
+        "signed-size",
+        "unsigned-crc",
+        "unsigned-compressed-size",
+        "unsigned-size",
+        "malformed-signature",
+        "ambiguous-layout",
+        "truncated",
+        "zip64",
+        "zip64-unsigned",
+    ],
+)
+def test_wheel_validation_rejects_invalid_data_descriptors(
+    tmp_path, phase: str, descriptor: str
+) -> None:
+    dist = _dist(tmp_path)
+    wheel = dist / "dcc_mcp_material_maker-0.4.1-py3-none-any.whl"
+    _write_descriptor_wheel(wheel, descriptor)
+
+    with zipfile.ZipFile(wheel) as archive:
+        assert archive.read("dcc_mcp_material_maker-0.4.1.dist-info/METADATA") == _metadata()
 
     with pytest.raises(ReleaseContractError, match="distribution archive mismatch"):
         if phase == "create":
