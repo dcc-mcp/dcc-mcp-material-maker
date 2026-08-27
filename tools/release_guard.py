@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import email.policy
 import hashlib
 import json
 import os
@@ -16,9 +17,13 @@ import re
 import stat
 import subprocess
 import sys
+import tarfile
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
+from datetime import datetime, timezone
+from email.parser import BytesParser
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +47,7 @@ class ReleaseSnapshot:
     tag: str
     source_sha: str
     release_id: int
+    release_node_id: str
     release_tag: str
     release_target: str
     draft: bool
@@ -71,6 +77,7 @@ class ReleaseSnapshot:
             snapshot.repository,
             snapshot.tag,
             snapshot.source_sha,
+            snapshot.release_node_id,
             snapshot.release_tag,
             snapshot.release_target,
             snapshot.created_at,
@@ -80,12 +87,13 @@ class ReleaseSnapshot:
         )
         if (
             type(snapshot.schema_version) is not int
-            or snapshot.schema_version != 1
+            or snapshot.schema_version != 2
             or type(snapshot.release_id) is not int
             or snapshot.release_id <= 0
             or type(snapshot.draft) is not bool
             or type(snapshot.prerelease) is not bool
             or type(snapshot.immutable) is not bool
+            or not snapshot.release_node_id
             or any(type(value) is not str for value in string_fields)
         ):
             raise ReleaseContractError("snapshot schema mismatch")
@@ -136,6 +144,63 @@ def _normalized_distribution_name(project: str) -> str:
     return re.sub(r"[-_.]+", "_", project)
 
 
+def _canonical_project_name(project: str) -> str:
+    return re.sub(r"[-_.]+", "-", project).lower()
+
+
+def _validate_metadata(payload: bytes, *, project: str, version: str) -> None:
+    if not payload or len(payload) > 1024 * 1024:
+        raise ReleaseContractError("distribution metadata mismatch")
+    try:
+        message = BytesParser(policy=email.policy.compat32).parsebytes(payload)
+    except Exception as error:
+        raise ReleaseContractError("distribution metadata mismatch") from error
+    names = message.get_all("Name", [])
+    versions = message.get_all("Version", [])
+    if (
+        len(names) != 1
+        or len(versions) != 1
+        or _canonical_project_name(str(names[0])) != _canonical_project_name(project)
+        or str(versions[0]) != version
+    ):
+        raise ReleaseContractError("distribution metadata mismatch")
+
+
+def _validate_wheel_metadata(path: Path, *, project: str, version: str) -> None:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            metadata = [
+                info
+                for info in archive.infolist()
+                if re.fullmatch(r"[^/]+\.dist-info/METADATA", info.filename)
+            ]
+            if len(metadata) != 1 or metadata[0].is_dir():
+                raise ReleaseContractError("distribution metadata mismatch")
+            payload = archive.read(metadata[0])
+    except (OSError, KeyError, zipfile.BadZipFile) as error:
+        raise ReleaseContractError("distribution metadata mismatch") from error
+    _validate_metadata(payload, project=project, version=version)
+
+
+def _validate_sdist_metadata(path: Path, *, project: str, version: str) -> None:
+    try:
+        with tarfile.open(path, "r:gz") as archive:
+            metadata = [
+                member
+                for member in archive.getmembers()
+                if re.fullmatch(r"[^/]+/PKG-INFO", member.name)
+            ]
+            if len(metadata) != 1 or not metadata[0].isfile():
+                raise ReleaseContractError("distribution metadata mismatch")
+            handle = archive.extractfile(metadata[0])
+            if handle is None:
+                raise ReleaseContractError("distribution metadata mismatch")
+            payload = handle.read(1024 * 1024 + 1)
+    except (OSError, EOFError, tarfile.TarError) as error:
+        raise ReleaseContractError("distribution metadata mismatch") from error
+    _validate_metadata(payload, project=project, version=version)
+
+
 def create_manifest(dist_dir: Path, *, project: str, version: str) -> dict[str, object]:
     """Create a canonical manifest for exactly one wheel and one sdist."""
 
@@ -156,6 +221,9 @@ def create_manifest(dist_dir: Path, *, project: str, version: str) -> dict[str, 
         raise ReleaseContractError("distribution identity does not match project version")
     if set(entries) != {wheels[0], sdists[0]}:
         raise ReleaseContractError("unexpected distribution files")
+
+    _validate_wheel_metadata(wheels[0], project=project, version=version)
+    _validate_sdist_metadata(sdists[0], project=project, version=version)
 
     artifacts = [
         {
@@ -216,6 +284,21 @@ def verify_manifest(manifest_path: Path, dist_dir: Path, expected_sha256: str) -
     version = manifest.get("version")
     if not isinstance(project, str) or not isinstance(version, str):
         raise ReleaseContractError("manifest schema mismatch")
+    expected_artifacts = _expected_assets(manifest)
+    if not dist_dir.is_dir() or _is_link_or_reparse(dist_dir):
+        raise ReleaseContractError("distribution directory is missing or unsafe")
+    entries = sorted(dist_dir.iterdir(), key=lambda item: item.name)
+    if {entry.name for entry in entries} != set(expected_artifacts):
+        raise ReleaseContractError("artifact digest mismatch")
+    for entry in entries:
+        expected = expected_artifacts[entry.name]
+        if (
+            not entry.is_file()
+            or _is_link_or_reparse(entry)
+            or entry.stat().st_size != expected.get("size")
+            or _sha256_file(entry) != expected.get("sha256")
+        ):
+            raise ReleaseContractError("artifact digest mismatch")
     rebuilt = create_manifest(dist_dir, project=project, version=version)
     if manifest != rebuilt:
         raise ReleaseContractError("artifact digest mismatch")
@@ -247,6 +330,7 @@ def _snapshot_from_release(
     release_payload: dict[str, object],
 ) -> tuple[ReleaseSnapshot, list[object]]:
     release_id = _require_release_field(release_payload, "id", int)
+    release_node_id = _require_release_field(release_payload, "node_id", str)
     release_tag = _require_release_field(release_payload, "tag_name", str)
     release_target = _require_release_field(release_payload, "target_commitish", str)
     draft = _require_release_field(release_payload, "draft", bool)
@@ -257,7 +341,7 @@ def _snapshot_from_release(
     release_url = _require_release_field(release_payload, "url", str)
     upload_url = _require_release_field(release_payload, "upload_url", str)
     assets = _require_release_field(release_payload, "assets", list)
-    if release_id <= 0 or release_tag != tag:
+    if release_id <= 0 or not release_node_id or release_tag != tag:
         raise ReleaseContractError("release identity drift")
     if release_target != source_sha:
         raise ReleaseContractError("release source drift")
@@ -271,11 +355,12 @@ def _snapshot_from_release(
         raise ReleaseContractError("release state drift")
     return (
         ReleaseSnapshot(
-            schema_version=1,
+            schema_version=2,
             repository=repository,
             tag=tag,
             source_sha=source_sha,
             release_id=release_id,
+            release_node_id=release_node_id,
             release_tag=release_tag,
             release_target=release_target,
             draft=draft,
@@ -370,6 +455,333 @@ def verify_published_assets(
             raise ReleaseContractError(f"published asset mismatch: {filename}")
 
 
+def _expected_assets(manifest: dict[str, object]) -> dict[str, dict[str, object]]:
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise ReleaseContractError("manifest schema mismatch")
+    expected: dict[str, dict[str, object]] = {}
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or set(artifact) != {"filename", "sha256", "size"}:
+            raise ReleaseContractError("manifest schema mismatch")
+        filename = artifact.get("filename")
+        if not isinstance(filename, str) or filename in expected:
+            raise ReleaseContractError("manifest schema mismatch")
+        expected[filename] = artifact
+    return expected
+
+
+def _assert_transaction_assets(
+    release_payload: dict[str, object], uploaded: list[dict[str, object]]
+) -> None:
+    assets = release_payload.get("assets")
+    if not isinstance(assets, list) or assets != uploaded:
+        raise ReleaseContractError("release asset set drift")
+
+
+def _validate_uploaded_asset(
+    asset: dict[str, object], expected: dict[str, object]
+) -> dict[str, object]:
+    if (
+        type(asset.get("id")) is not int
+        or asset["id"] <= 0
+        or asset.get("name") != expected.get("filename")
+        or asset.get("size") != expected.get("size")
+        or asset.get("state") != "uploaded"
+        or asset.get("digest") != f"sha256:{expected.get('sha256')}"
+    ):
+        raise ReleaseContractError(f"uploaded asset mismatch: {expected.get('filename')}")
+    return asset
+
+
+def _record_uploaded_asset(asset: dict[str, object]) -> dict[str, object]:
+    if type(asset.get("id")) is not int or asset["id"] <= 0:
+        raise ReleaseContractError("uploaded asset identity is missing")
+    return asset
+
+
+def _asset_matches_expected(asset: object, expected: dict[str, object]) -> bool:
+    return (
+        isinstance(asset, dict)
+        and type(asset.get("id")) is int
+        and asset["id"] > 0
+        and asset.get("name") == expected.get("filename")
+        and asset.get("size") == expected.get("size")
+        and asset.get("state") == "uploaded"
+        and asset.get("digest") == f"sha256:{expected.get('sha256')}"
+    )
+
+
+def _parse_github_time(value: object, *, label: str) -> datetime:
+    if not isinstance(value, str) or not value:
+        raise ReleaseContractError(f"invalid artifact {label}")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ReleaseContractError(f"invalid artifact {label}") from error
+    if parsed.tzinfo is None:
+        raise ReleaseContractError(f"invalid artifact {label}")
+    return parsed.astimezone(timezone.utc)
+
+
+def verify_artifact_metadata(
+    metadata: dict[str, object],
+    *,
+    repository: str,
+    artifact_id: int,
+    artifact_digest: str,
+    source_sha: str,
+    run_id: int,
+    name: str,
+    now: datetime | None = None,
+) -> None:
+    """Verify one immutable Actions artifact against its server-side provenance."""
+
+    _validate_repository(repository)
+    _validate_source_sha(source_sha)
+    if type(artifact_id) is not int or artifact_id <= 0 or type(run_id) is not int or run_id <= 0:
+        raise ReleaseContractError("invalid artifact identity")
+    if not SHA256_RE.fullmatch(artifact_digest):
+        raise ReleaseContractError("invalid artifact digest")
+    if metadata.get("id") != artifact_id or metadata.get("name") != name:
+        raise ReleaseContractError("artifact identity drift")
+    if type(metadata.get("size_in_bytes")) is not int or metadata["size_in_bytes"] <= 0:
+        raise ReleaseContractError("artifact state drift")
+    expected_url = f"https://api.github.com/repos/{repository}/actions/artifacts/{artifact_id}"
+    if (
+        metadata.get("url") != expected_url
+        or metadata.get("archive_download_url") != f"{expected_url}/zip"
+    ):
+        raise ReleaseContractError("artifact repository drift")
+    if metadata.get("expired") is not False:
+        raise ReleaseContractError("artifact expired")
+    if metadata.get("digest") != f"sha256:{artifact_digest}":
+        raise ReleaseContractError("artifact digest drift")
+
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        raise ReleaseContractError("invalid verification time")
+    _parse_github_time(metadata.get("created_at"), label="created_at")
+    _parse_github_time(metadata.get("updated_at"), label="updated_at")
+    if _parse_github_time(metadata.get("expires_at"), label="expires_at") <= current_time:
+        raise ReleaseContractError("artifact expired")
+
+    workflow_run = metadata.get("workflow_run")
+    if not isinstance(workflow_run, dict) or workflow_run.get("id") != run_id:
+        raise ReleaseContractError("artifact workflow run drift")
+    repository_id = workflow_run.get("repository_id")
+    if (
+        type(repository_id) is not int
+        or repository_id <= 0
+        or workflow_run.get("head_repository_id") != repository_id
+    ):
+        raise ReleaseContractError("artifact repository drift")
+    if workflow_run.get("head_sha") != source_sha:
+        raise ReleaseContractError("artifact source drift")
+    if workflow_run.get("head_branch") != "main":
+        raise ReleaseContractError("artifact source branch drift")
+
+
+def publish_assets_transactional(
+    snapshot: ReleaseSnapshot,
+    manifest: dict[str, object],
+    dist_dir: Path,
+    github: Any,
+) -> None:
+    """Publish every distribution to one numeric Release ID or restore an empty set."""
+
+    project = manifest.get("project")
+    version = manifest.get("version")
+    if not isinstance(project, str) or not isinstance(version, str):
+        raise ReleaseContractError("manifest schema mismatch")
+    if create_manifest(dist_dir, project=project, version=version) != manifest:
+        raise ReleaseContractError("artifact digest mismatch")
+    expected = _expected_assets(manifest)
+
+    ref_payload, release_payload = github.recapture_release(snapshot)
+    verify_snapshot(
+        snapshot,
+        ref_payload=ref_payload,
+        release_payload=release_payload,
+        expect_no_assets=True,
+    )
+
+    uploaded: list[dict[str, object]] = []
+    pending: dict[str, object] | None = None
+    try:
+        for filename, artifact in expected.items():
+            pending = None
+            ref_payload, release_payload = github.recapture_release(snapshot)
+            verify_snapshot(
+                snapshot,
+                ref_payload=ref_payload,
+                release_payload=release_payload,
+                expect_no_assets=not uploaded,
+            )
+            _assert_transaction_assets(release_payload, uploaded)
+            pending = artifact
+            response = github.upload_asset(snapshot.release_id, dist_dir / filename)
+            uploaded.append(_record_uploaded_asset(response))
+            _validate_uploaded_asset(response, artifact)
+            pending = None
+
+        ref_payload, release_payload = github.recapture_release(snapshot)
+        verify_published_assets(
+            snapshot,
+            manifest,
+            ref_payload=ref_payload,
+            release_payload=release_payload,
+        )
+    except Exception as error:
+        try:
+            if pending is not None:
+                ref_payload, release_payload = github.recapture_release(snapshot)
+                verify_snapshot(
+                    snapshot,
+                    ref_payload=ref_payload,
+                    release_payload=release_payload,
+                    expect_no_assets=False,
+                )
+                current_assets = release_payload.get("assets")
+                if not isinstance(current_assets, list):
+                    raise ReleaseContractError("release asset set drift")
+                known_ids = {asset["id"] for asset in uploaded}
+                candidates = [
+                    asset
+                    for asset in current_assets
+                    if isinstance(asset, dict)
+                    and asset.get("id") not in known_ids
+                    and _asset_matches_expected(asset, pending)
+                ]
+                if len(candidates) > 1:
+                    raise ReleaseContractError("ambiguous transaction asset identity")
+                if candidates:
+                    uploaded.append(candidates[0])
+            for asset in reversed(uploaded):
+                ref_payload, release_payload = github.recapture_release(snapshot)
+                verify_snapshot(
+                    snapshot,
+                    ref_payload=ref_payload,
+                    release_payload=release_payload,
+                    expect_no_assets=False,
+                )
+                current_assets = release_payload.get("assets")
+                if not isinstance(current_assets, list) or not any(
+                    isinstance(current, dict) and current.get("id") == asset["id"]
+                    for current in current_assets
+                ):
+                    raise ReleaseContractError("transaction asset identity drift")
+                github.delete_asset(snapshot.release_id, asset["id"])
+                uploaded.remove(asset)
+            ref_payload, release_payload = github.recapture_release(snapshot)
+            verify_snapshot(
+                snapshot,
+                ref_payload=ref_payload,
+                release_payload=release_payload,
+                expect_no_assets=True,
+            )
+        except Exception as rollback_error:
+            raise ReleaseContractError(
+                "asset publication failed and rollback was incomplete"
+            ) from rollback_error
+        if isinstance(error, ReleaseContractError):
+            raise
+        raise ReleaseContractError(f"GitHub asset publication failed: {error}") from error
+
+
+class GitHubReleaseClient:
+    """Bounded GitHub REST client for one repository's numeric release endpoints."""
+
+    def __init__(self, repository: str, token: str) -> None:
+        _validate_repository(repository)
+        if not token:
+            raise ReleaseContractError("GitHub token is required for release publication")
+        self.repository = repository
+        self._token = token
+
+    def _json_request(
+        self,
+        url: str,
+        *,
+        method: str = "GET",
+        data: bytes | None = None,
+        content_type: str | None = None,
+    ) -> dict[str, object]:
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {self._token}",
+            "User-Agent": "dcc-mcp-material-maker-release-guard",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if content_type is not None:
+            headers["Content-Type"] = content_type
+        request = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                payload = json.load(response)
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as error:
+            raise ReleaseContractError(f"GitHub {method} request failed") from error
+        if not isinstance(payload, dict):
+            raise ReleaseContractError("GitHub response was not an object")
+        return payload
+
+    def recapture_release(
+        self, snapshot: ReleaseSnapshot
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        if snapshot.repository != self.repository:
+            raise ReleaseContractError("release repository drift")
+        encoded_tag = urllib.parse.quote(snapshot.tag, safe="")
+        base = f"https://api.github.com/repos/{self.repository}"
+        return (
+            self._json_request(f"{base}/git/ref/tags/{encoded_tag}"),
+            self._json_request(f"{base}/releases/{snapshot.release_id}"),
+        )
+
+    def recapture_artifact(self, artifact_id: int) -> dict[str, object]:
+        if type(artifact_id) is not int or artifact_id <= 0:
+            raise ReleaseContractError("invalid artifact identity")
+        url = f"https://api.github.com/repos/{self.repository}/actions/artifacts/{artifact_id}"
+        return self._json_request(url)
+
+    def upload_asset(self, release_id: int, path: Path) -> dict[str, object]:
+        if type(release_id) is not int or release_id <= 0:
+            raise ReleaseContractError("invalid release identity")
+        if not path.is_file() or _is_link_or_reparse(path):
+            raise ReleaseContractError("distribution asset is missing or unsafe")
+        encoded_name = urllib.parse.quote(path.name, safe="")
+        url = (
+            f"https://uploads.github.com/repos/{self.repository}/releases/"
+            f"{release_id}/assets?name={encoded_name}"
+        )
+        return self._json_request(
+            url,
+            method="POST",
+            data=path.read_bytes(),
+            content_type="application/octet-stream",
+        )
+
+    def delete_asset(self, release_id: int, asset_id: int) -> None:
+        if (
+            type(release_id) is not int
+            or release_id <= 0
+            or type(asset_id) is not int
+            or asset_id <= 0
+        ):
+            raise ReleaseContractError("invalid release asset identity")
+        url = f"https://api.github.com/repos/{self.repository}/releases/assets/{asset_id}"
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {self._token}",
+            "User-Agent": "dcc-mcp-material-maker-release-guard",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        request = urllib.request.Request(url, headers=headers, method="DELETE")
+        try:
+            with urllib.request.urlopen(request, timeout=30):
+                return
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as error:
+            raise ReleaseContractError("GitHub DELETE request failed") from error
+
+
 def _github_json(repository: str, path: str, token: str) -> dict[str, object]:
     if not token:
         raise ReleaseContractError("GitHub token is required for identity recapture")
@@ -459,7 +871,18 @@ def _common_live(
         or snapshot.release_id != args.expected_release_id
     ):
         raise ReleaseContractError("trusted release snapshot does not match workflow outputs")
-    ref_payload, release_payload = _live_payloads(args.repository, args.tag, args.github_token)
+    client = GitHubReleaseClient(args.repository, args.github_token)
+    artifact_payload = client.recapture_artifact(args.artifact_id)
+    verify_artifact_metadata(
+        artifact_payload,
+        repository=args.repository,
+        artifact_id=args.artifact_id,
+        artifact_digest=args.artifact_digest,
+        source_sha=args.source_sha,
+        run_id=args.run_id,
+        name=args.artifact_name,
+    )
+    ref_payload, release_payload = client.recapture_release(snapshot)
     return snapshot, manifest, ref_payload, release_payload
 
 
@@ -508,6 +931,32 @@ def _verify_assets_command(args: argparse.Namespace) -> None:
     )
 
 
+def _verify_artifact_command(args: argparse.Namespace) -> None:
+    _verify_local_checkout(args.source_sha)
+    client = GitHubReleaseClient(args.repository, args.github_token)
+    verify_artifact_metadata(
+        client.recapture_artifact(args.artifact_id),
+        repository=args.repository,
+        artifact_id=args.artifact_id,
+        artifact_digest=args.artifact_digest,
+        source_sha=args.source_sha,
+        run_id=args.run_id,
+        name=args.artifact_name,
+    )
+
+
+def _publish_assets_command(args: argparse.Namespace) -> None:
+    snapshot, manifest, ref_payload, release_payload = _common_live(args)
+    verify_snapshot(
+        snapshot,
+        ref_payload=ref_payload,
+        release_payload=release_payload,
+        expect_no_assets=True,
+    )
+    client = GitHubReleaseClient(args.repository, args.github_token)
+    publish_assets_transactional(snapshot, manifest, args.dist_dir, client)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -531,6 +980,10 @@ def _parser() -> argparse.ArgumentParser:
     verify_common.add_argument("--expected-release-id", required=True, type=int)
     verify_common.add_argument("--expected-manifest-sha256", required=True)
     verify_common.add_argument("--expected-snapshot-sha256", required=True)
+    verify_common.add_argument("--artifact-id", required=True, type=int)
+    verify_common.add_argument("--artifact-digest", required=True)
+    verify_common.add_argument("--run-id", required=True, type=int)
+    verify_common.add_argument("--artifact-name", default="release-distributions")
 
     verify = subparsers.add_parser("verify", parents=[common, verify_common])
     verify.add_argument("--expect-no-assets", action="store_true", required=True)
@@ -538,6 +991,22 @@ def _parser() -> argparse.ArgumentParser:
 
     verify_assets = subparsers.add_parser("verify-assets", parents=[common, verify_common])
     verify_assets.set_defaults(handler=_verify_assets_command)
+
+    verify_artifact = subparsers.add_parser("verify-artifact")
+    verify_artifact.add_argument("--repository", required=True)
+    verify_artifact.add_argument("--source-sha", required=True)
+    verify_artifact.add_argument("--artifact-id", required=True, type=int)
+    verify_artifact.add_argument("--artifact-digest", required=True)
+    verify_artifact.add_argument("--run-id", required=True, type=int)
+    verify_artifact.add_argument("--artifact-name", default="release-distributions")
+    verify_artifact.add_argument(
+        "--github-token",
+        default=os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or "",
+    )
+    verify_artifact.set_defaults(handler=_verify_artifact_command)
+
+    publish_assets = subparsers.add_parser("publish-assets", parents=[common, verify_common])
+    publish_assets.set_defaults(handler=_publish_assets_command)
     return parser
 
 
