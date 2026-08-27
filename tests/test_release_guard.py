@@ -199,10 +199,12 @@ class _UnseekableWheelSink(io.RawIOBase):
 def _write_descriptor_wheel(path: Path, descriptor: str) -> None:
     sink = _UnseekableWheelSink()
     with zipfile.ZipFile(sink, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr(
-            f"dcc_mcp_material_maker-{VERSION}.dist-info/METADATA",
-            _metadata(),
-        )
+        name = f"dcc_mcp_material_maker-{VERSION}.dist-info/METADATA"
+        if descriptor.startswith("zip64-"):
+            with archive.open(name, "w", force_zip64=True) as member:
+                member.write(_metadata())
+        else:
+            archive.writestr(name, _metadata())
 
     raw = bytearray(sink.buffer.getvalue())
     end_offset = raw.rindex(b"PK\x05\x06")
@@ -213,11 +215,14 @@ def _write_descriptor_wheel(path: Path, descriptor: str) -> None:
     name_length, extra_length = struct.unpack_from("<HH", raw, local_header + 26)
     payload_offset = local_header + 30 + name_length + extra_length
     descriptor_offset = payload_offset + compressed_size
-    assert descriptor_offset + 16 == central_offset
+    descriptor_size = 24 if descriptor.startswith("zip64-") else 16
+    assert descriptor_offset + descriptor_size == central_offset
     assert raw[descriptor_offset : descriptor_offset + 4] == b"PK\x07\x08"
 
     signed = struct.pack("<4sIII", b"PK\x07\x08", crc, compressed_size, size)
     unsigned = struct.pack("<III", crc, compressed_size, size)
+    zip64_signed = struct.pack("<4sIQQ", b"PK\x07\x08", crc, compressed_size, size)
+    zip64_unsigned = struct.pack("<IQQ", crc, compressed_size, size)
     replacements = {
         "signed": signed,
         "unsigned": unsigned,
@@ -232,14 +237,74 @@ def _write_descriptor_wheel(path: Path, descriptor: str) -> None:
         "malformed-signature": b"BAD!" + signed[4:],
         "ambiguous-layout": unsigned + b"JUNK",
         "truncated": signed[:-1],
-        "zip64": struct.pack("<4sIQQ", b"PK\x07\x08", crc, compressed_size, size),
-        "zip64-unsigned": struct.pack("<IQQ", crc, compressed_size, size),
+        "zip64-signed": zip64_signed,
+        "zip64-unsigned": zip64_unsigned,
+        "zip64-signed-crc": struct.pack(
+            "<4sIQQ", b"PK\x07\x08", crc ^ 0xFFFFFFFF, compressed_size, size
+        ),
+        "zip64-signed-compressed-size": struct.pack(
+            "<4sIQQ", b"PK\x07\x08", crc, compressed_size + 1, size
+        ),
+        "zip64-signed-size": struct.pack("<4sIQQ", b"PK\x07\x08", crc, compressed_size, size + 1),
+        "zip64-unsigned-crc": struct.pack("<IQQ", crc ^ 0xFFFFFFFF, compressed_size, size),
+        "zip64-unsigned-compressed-size": struct.pack("<IQQ", crc, compressed_size + 1, size),
+        "zip64-unsigned-size": struct.pack("<IQQ", crc, compressed_size, size + 1),
+        "zip64-malformed-signature": b"BAD!" + zip64_signed[4:],
+        "zip64-ambiguous-layout": zip64_unsigned + b"JUNK",
+        "zip64-truncated": zip64_signed[:-1],
     }
     replacement = replacements[descriptor]
     raw[descriptor_offset:central_offset] = replacement
-    delta = len(replacement) - 16
+    delta = len(replacement) - descriptor_size
     new_end_offset = end_offset + delta
     struct.pack_into("<I", raw, new_end_offset + 16, central_offset + delta)
+    path.write_bytes(raw)
+
+
+def _corrupt_descriptor_wheel_structure(path: Path, corruption: str) -> None:
+    _write_descriptor_wheel(path, "zip64-signed" if corruption.startswith("zip64-") else "signed")
+    raw = bytearray(path.read_bytes())
+    end_offset = raw.rindex(b"PK\x05\x06")
+    central_offset = struct.unpack_from("<I", raw, end_offset + 16)[0]
+    central_header = raw.index(b"PK\x01\x02", central_offset)
+    local_header = struct.unpack_from("<I", raw, central_header + 42)[0]
+
+    if corruption == "local-flags":
+        local_flags = struct.unpack_from("<H", raw, local_header + 6)[0]
+        struct.pack_into("<H", raw, local_header + 6, local_flags ^ 0x08)
+    elif corruption == "local-name":
+        name_length = struct.unpack_from("<H", raw, local_header + 26)[0]
+        name_offset = local_header + 30
+        raw[name_offset + name_length - 1] ^= 1
+    elif corruption == "duplicate-local-offset":
+        central_size = struct.unpack_from("<I", raw, end_offset + 12)[0]
+        central_record = bytes(raw[central_offset : central_offset + central_size])
+        raw[end_offset:end_offset] = central_record
+        new_end_offset = end_offset + central_size
+        entries = struct.unpack_from("<H", raw, new_end_offset + 10)[0]
+        struct.pack_into("<H", raw, new_end_offset + 8, entries + 1)
+        struct.pack_into("<H", raw, new_end_offset + 10, entries + 1)
+        struct.pack_into("<I", raw, new_end_offset + 12, central_size * 2)
+    elif corruption == "zip64-duplicate-extra":
+        name_length, extra_length = struct.unpack_from("<HH", raw, local_header + 26)
+        extra_offset = local_header + 30 + name_length
+        zip64_extra = bytes(raw[extra_offset : extra_offset + extra_length])
+        assert len(zip64_extra) == 20
+        raw[extra_offset + extra_length : extra_offset + extra_length] = zip64_extra
+        struct.pack_into("<H", raw, local_header + 28, extra_length * 2)
+        new_end_offset = end_offset + extra_length
+        struct.pack_into("<I", raw, new_end_offset + 16, central_offset + extra_length)
+    elif corruption == "zip64-conflicting-extra":
+        name_length = struct.unpack_from("<H", raw, local_header + 26)[0]
+        extra_offset = local_header + 30 + name_length
+        declared_size = struct.unpack_from("<Q", raw, extra_offset + 4)[0]
+        struct.pack_into("<Q", raw, extra_offset + 4, declared_size + 1)
+    elif corruption == "zip64-malformed-extra":
+        name_length = struct.unpack_from("<H", raw, local_header + 26)[0]
+        extra_offset = local_header + 30 + name_length
+        struct.pack_into("<H", raw, extra_offset + 2, 17)
+    else:  # pragma: no cover - test helper contract
+        raise AssertionError(f"unknown corruption: {corruption}")
     path.write_bytes(raw)
 
 
@@ -829,7 +894,7 @@ def test_wheel_validation_reads_and_checks_every_regular_member(
 
 
 @pytest.mark.parametrize("phase", ["create", "verify"])
-@pytest.mark.parametrize("descriptor", ["signed", "unsigned"])
+@pytest.mark.parametrize("descriptor", ["signed", "unsigned", "zip64-signed", "zip64-unsigned"])
 def test_wheel_validation_accepts_matching_data_descriptors(
     tmp_path, phase: str, descriptor: str
 ) -> None:
@@ -858,8 +923,15 @@ def test_wheel_validation_accepts_matching_data_descriptors(
         "malformed-signature",
         "ambiguous-layout",
         "truncated",
-        "zip64",
-        "zip64-unsigned",
+        "zip64-signed-crc",
+        "zip64-signed-compressed-size",
+        "zip64-signed-size",
+        "zip64-unsigned-crc",
+        "zip64-unsigned-compressed-size",
+        "zip64-unsigned-size",
+        "zip64-malformed-signature",
+        "zip64-ambiguous-layout",
+        "zip64-truncated",
     ],
 )
 def test_wheel_validation_rejects_invalid_data_descriptors(
@@ -879,6 +951,60 @@ def test_wheel_validation_rejects_invalid_data_descriptors(
             manifest_path = tmp_path / "manifest.json"
             manifest_sha256 = _write_current_dist_manifest(dist, manifest_path)
             verify_manifest(manifest_path, dist, manifest_sha256)
+
+
+@pytest.mark.parametrize("phase", ["create", "verify"])
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "local-flags",
+        "local-name",
+        "duplicate-local-offset",
+        "zip64-duplicate-extra",
+        "zip64-conflicting-extra",
+        "zip64-malformed-extra",
+    ],
+)
+def test_wheel_validation_rejects_descriptor_record_conflicts(
+    tmp_path, phase: str, corruption: str
+) -> None:
+    dist = _dist(tmp_path)
+    wheel = dist / "dcc_mcp_material_maker-0.4.1-py3-none-any.whl"
+    _corrupt_descriptor_wheel_structure(wheel, corruption)
+
+    with pytest.raises(ReleaseContractError, match="distribution archive mismatch"):
+        if phase == "create":
+            create_manifest(dist, project=PROJECT, version=VERSION)
+        else:
+            manifest_path = tmp_path / "manifest.json"
+            manifest_sha256 = _write_current_dist_manifest(dist, manifest_path)
+            verify_manifest(manifest_path, dist, manifest_sha256)
+
+
+def test_asset_publisher_reuses_shared_descriptor_validator_before_github_mutation(
+    tmp_path,
+) -> None:
+    dist = _dist(tmp_path)
+    manifest = create_manifest(dist, project=PROJECT, version=VERSION)
+    wheel = dist / "dcc_mcp_material_maker-0.4.1-py3-none-any.whl"
+    _write_descriptor_wheel(wheel, "signed-crc")
+    snapshot = capture_snapshot(
+        repository="dcc-mcp/dcc-mcp-material-maker",
+        tag=TAG,
+        source_sha=SHA,
+        ref_payload=_ref(),
+        release_payload=_release(),
+    )
+
+    class NoGitHubMutation:
+        def recapture_artifact(self, _artifact_id: int):
+            raise AssertionError("GitHub must not be called before archive validation")
+
+        def __getattr__(self, name: str):
+            raise AssertionError(f"GitHub must not be called before archive validation: {name}")
+
+    with pytest.raises(ReleaseContractError, match="distribution archive mismatch"):
+        publish_assets_transactional(snapshot, manifest, dist, NoGitHubMutation())
 
 
 @pytest.mark.parametrize("phase", ["create", "verify"])

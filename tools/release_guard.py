@@ -482,24 +482,50 @@ def _validate_wheel_data_descriptor(
     *,
     descriptor_offset: int,
     record_end: int,
+    zip64: bool,
 ) -> None:
     descriptor_size = record_end - descriptor_offset
-    if descriptor_size not in {12, 16}:
+    unsigned_size = 20 if zip64 else 12
+    signed_size = unsigned_size + 4
+    if descriptor_size not in {unsigned_size, signed_size}:
         raise ReleaseContractError("distribution archive mismatch")
     handle.seek(descriptor_offset)
     descriptor = handle.read(descriptor_size)
     if len(descriptor) != descriptor_size:
         raise ReleaseContractError("distribution archive mismatch")
-    if descriptor_size == 16:
+    if descriptor_size == signed_size:
         if descriptor[:4] != b"PK\x07\x08":
             raise ReleaseContractError("distribution archive mismatch")
-        values = struct.unpack("<III", descriptor[4:])
+        descriptor = descriptor[4:]
     else:
         if descriptor[:4] == b"PK\x07\x08":
             raise ReleaseContractError("distribution archive mismatch")
-        values = struct.unpack("<III", descriptor)
+    values = struct.unpack("<IQQ" if zip64 else "<III", descriptor)
     if values != (info.CRC, info.compress_size, info.file_size):
         raise ReleaseContractError("distribution archive mismatch")
+
+
+def _wheel_local_zip64_values(extra: bytes) -> tuple[int, int] | None:
+    offset = 0
+    zip64_payload: bytes | None = None
+    while offset < len(extra):
+        if len(extra) - offset < 4:
+            raise ReleaseContractError("distribution archive mismatch")
+        field_id, field_size = struct.unpack_from("<HH", extra, offset)
+        offset += 4
+        field_end = offset + field_size
+        if field_end > len(extra):
+            raise ReleaseContractError("distribution archive mismatch")
+        if field_id == 0x0001:
+            if zip64_payload is not None:
+                raise ReleaseContractError("distribution archive mismatch")
+            zip64_payload = extra[offset:field_end]
+        offset = field_end
+    if zip64_payload is None:
+        return None
+    if len(zip64_payload) != 16:
+        raise ReleaseContractError("distribution archive mismatch")
+    return struct.unpack("<QQ", zip64_payload)
 
 
 def _validate_wheel_local_header(
@@ -516,7 +542,7 @@ def _validate_wheel_local_header(
             raise ReleaseContractError("distribution archive mismatch")
         (
             signature,
-            _extract_version,
+            extract_version,
             flags,
             compression,
             _modified_time,
@@ -533,23 +559,38 @@ def _validate_wheel_local_header(
             signature != b"PK\x03\x04"
             or len(local_name) != name_length
             or len(local_extra) != extra_length
+            or extract_version != info.extract_version
             or flags != info.flag_bits
             or compression != info.compress_type
-            or compressed_size == 0xFFFFFFFF
-            or size == 0xFFFFFFFF
         ):
             raise ReleaseContractError("distribution archive mismatch")
         _strict_utf8_archive_name(local_name, info.orig_filename)
+        zip64_values = _wheel_local_zip64_values(local_extra)
+        uses_data_descriptor = bool(flags & 0x08)
+        uses_zip64 = zip64_values is not None
+        if uses_zip64:
+            if uses_data_descriptor:
+                if (compressed_size, size) not in {
+                    (0, 0),
+                    (0xFFFFFFFF, 0xFFFFFFFF),
+                }:
+                    raise ReleaseContractError("distribution archive mismatch")
+            elif (compressed_size, size) != (0xFFFFFFFF, 0xFFFFFFFF):
+                raise ReleaseContractError("distribution archive mismatch")
+            zip64_size, zip64_compressed_size = zip64_values
+        else:
+            if compressed_size == 0xFFFFFFFF or size == 0xFFFFFFFF:
+                raise ReleaseContractError("distribution archive mismatch")
+            zip64_size, zip64_compressed_size = size, compressed_size
         data_offset = info.header_offset + 30 + name_length + extra_length
         payload_end = data_offset + info.compress_size
         if data_offset > payload_end or payload_end > record_end:
             raise ReleaseContractError("distribution archive mismatch")
-        uses_data_descriptor = bool(flags & 0x08)
         if uses_data_descriptor:
             if (
                 crc not in {0, info.CRC}
-                or compressed_size not in {0, info.compress_size}
-                or size not in {0, info.file_size}
+                or zip64_compressed_size not in {0, info.compress_size}
+                or zip64_size not in {0, info.file_size}
             ):
                 raise ReleaseContractError("distribution archive mismatch")
             _validate_wheel_data_descriptor(
@@ -557,8 +598,13 @@ def _validate_wheel_local_header(
                 info,
                 descriptor_offset=payload_end,
                 record_end=record_end,
+                zip64=uses_zip64,
             )
-        elif (crc, compressed_size, size) != (info.CRC, info.compress_size, info.file_size):
+        elif (crc, zip64_compressed_size, zip64_size) != (
+            info.CRC,
+            info.compress_size,
+            info.file_size,
+        ):
             raise ReleaseContractError("distribution archive mismatch")
     except (OSError, struct.error) as error:
         raise ReleaseContractError("distribution archive mismatch") from error
