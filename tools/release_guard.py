@@ -16,6 +16,7 @@ import os
 import re
 import secrets
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -175,18 +176,42 @@ def _validate_metadata(payload: bytes, *, project: str, version: str) -> None:
         raise ReleaseContractError("distribution metadata mismatch")
 
 
-def _validate_archive_path(name: str) -> None:
+_WINDOWS_FORBIDDEN_MEMBER_CHARACTERS = frozenset('<>:"|?*')
+_WINDOWS_RESERVED_MEMBER_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{index}" for index in range(1, 10)}
+    | {f"lpt{index}" for index in range(1, 10)}
+)
+
+
+def _canonical_archive_member_key(name: str) -> str:
+    """Return one portable comparison key or reject an unsafe member path."""
+
     canonical = name[:-1] if name.endswith("/") else name
-    parts = canonical.split("/")
-    if (
-        not canonical
-        or name.startswith("/")
-        or "\\" in name
-        or re.match(r"^[A-Za-z]:", name)
-        or any(unicodedata.category(character) == "Cc" for character in name)
-        or any(part in {"", ".", ".."} for part in parts)
-    ):
+    if not canonical or name.startswith("/") or "\\" in name or re.match(r"^[A-Za-z]:", name):
         raise ReleaseContractError("distribution archive mismatch")
+
+    key_parts: list[str] = []
+    for part in canonical.split("/"):
+        normalized = unicodedata.normalize("NFKC", part)
+        key = unicodedata.normalize("NFKC", normalized.casefold())
+        if (
+            part in {"", ".", ".."}
+            or normalized in {"", ".", ".."}
+            or key in {"", ".", ".."}
+            or part.endswith((".", " "))
+            or normalized.endswith((".", " "))
+            or key.endswith((".", " "))
+            or any(
+                unicodedata.category(character) in {"Cc", "Cf"}
+                or character in _WINDOWS_FORBIDDEN_MEMBER_CHARACTERS
+                for character in normalized
+            )
+            or key.split(".", 1)[0] in _WINDOWS_RESERVED_MEMBER_NAMES
+        ):
+            raise ReleaseContractError("distribution archive mismatch")
+        key_parts.append(key)
+    return "/".join(key_parts)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -208,12 +233,13 @@ def _validate_archive_members(
     expected_root: str,
     require_single_root: bool,
     reserved_root_suffix: str | None = None,
-) -> object:
+) -> tuple[_ArchiveMember, list[_ArchiveMember]]:
     """Validate every archive member before returning the unique metadata member."""
 
     if archive_size <= 0:
         raise ReleaseContractError("distribution archive mismatch")
-    seen_paths: set[str] = set()
+    member_types: dict[str, bool] = {}
+    validated_members: list[_ArchiveMember] = []
     metadata_members: list[_ArchiveMember] = []
     total_size = 0
     member_count = 0
@@ -221,16 +247,22 @@ def _validate_archive_members(
         member_count += 1
         if member_count > ARCHIVE_MAX_MEMBERS:
             raise ReleaseContractError("distribution archive mismatch")
-        _validate_archive_path(member.path)
+        member_key = _canonical_archive_member_key(member.path)
         canonical_path = member.path.rstrip("/")
-        if canonical_path in seen_paths or not (member.is_file or member.is_dir):
+        if member_key in member_types or member.is_file == member.is_dir:
             raise ReleaseContractError("distribution archive mismatch")
-        seen_paths.add(canonical_path)
+        member_types[member_key] = member.is_file
+        validated_members.append(member)
 
         root = canonical_path.split("/", 1)[0]
         if require_single_root and root != expected_root:
             raise ReleaseContractError("distribution archive mismatch")
-        if reserved_root_suffix and root.endswith(reserved_root_suffix) and root != expected_root:
+        root_key = member_key.split("/", 1)[0]
+        if (
+            reserved_root_suffix
+            and root_key.endswith(unicodedata.normalize("NFKC", reserved_root_suffix).casefold())
+            and root != expected_root
+        ):
             raise ReleaseContractError("distribution archive mismatch")
 
         if member.size < 0 or member.size > ARCHIVE_MAX_MEMBER_SIZE:
@@ -252,6 +284,14 @@ def _validate_archive_members(
         if canonical_path.rsplit("/", 1)[-1] == metadata_basename:
             metadata_members.append(member)
 
+    file_keys = {key for key, is_file in member_types.items() if is_file}
+    for member_key in member_types:
+        parent = member_key
+        while "/" in parent:
+            parent = parent.rsplit("/", 1)[0]
+            if parent in file_keys:
+                raise ReleaseContractError("distribution archive mismatch")
+
     if member_count == 0 or total_size > archive_size * ARCHIVE_MAX_COMPRESSION_RATIO:
         raise ReleaseContractError("distribution archive mismatch")
     if (
@@ -261,7 +301,75 @@ def _validate_archive_members(
         or metadata_members[0].size > ARCHIVE_MAX_METADATA_SIZE
     ):
         raise ReleaseContractError("distribution archive mismatch")
-    return metadata_members[0].source
+    return metadata_members[0], validated_members
+
+
+def _read_regular_member(handle: Any, *, expected_size: int, capture: bool) -> bytes:
+    payload = bytearray()
+    total = 0
+    while True:
+        chunk = handle.read(min(1024 * 1024, expected_size - total + 1))
+        if not chunk:
+            break
+        if not isinstance(chunk, bytes):
+            raise ReleaseContractError("distribution archive mismatch")
+        total += len(chunk)
+        if total > expected_size:
+            raise ReleaseContractError("distribution archive mismatch")
+        if capture:
+            payload.extend(chunk)
+    if total != expected_size:
+        raise ReleaseContractError("distribution archive mismatch")
+    return bytes(payload)
+
+
+def _validate_wheel_local_header(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> None:
+    handle = archive.fp
+    if handle is None:
+        raise ReleaseContractError("distribution archive mismatch")
+    previous_offset = handle.tell()
+    try:
+        handle.seek(info.header_offset)
+        fixed = handle.read(30)
+        if len(fixed) != 30:
+            raise ReleaseContractError("distribution archive mismatch")
+        (
+            signature,
+            _extract_version,
+            flags,
+            compression,
+            _modified_time,
+            _modified_date,
+            crc,
+            compressed_size,
+            size,
+            name_length,
+            extra_length,
+        ) = struct.unpack("<4s5H3I2H", fixed)
+        local_name = handle.read(name_length)
+        local_extra = handle.read(extra_length)
+        if (
+            signature != b"PK\x03\x04"
+            or len(local_name) != name_length
+            or len(local_extra) != extra_length
+            or flags != info.flag_bits
+            or compression != info.compress_type
+        ):
+            raise ReleaseContractError("distribution archive mismatch")
+        uses_data_descriptor = bool(flags & 0x08)
+        if uses_data_descriptor:
+            if (
+                crc not in {0, info.CRC}
+                or compressed_size not in {0, info.compress_size}
+                or size not in {0, info.file_size}
+            ):
+                raise ReleaseContractError("distribution archive mismatch")
+        elif (crc, compressed_size, size) != (info.CRC, info.compress_size, info.file_size):
+            raise ReleaseContractError("distribution archive mismatch")
+    except (OSError, struct.error) as error:
+        raise ReleaseContractError("distribution archive mismatch") from error
+    finally:
+        handle.seek(previous_offset)
 
 
 def _wheel_member(info: zipfile.ZipInfo) -> _ArchiveMember:
@@ -283,7 +391,7 @@ def _validate_wheel_metadata(path: Path, *, project: str, version: str) -> None:
     expected_metadata = f"{expected_root}/METADATA"
     try:
         with zipfile.ZipFile(path) as archive:
-            metadata = _validate_archive_members(
+            metadata, members = _validate_archive_members(
                 (_wheel_member(info) for info in archive.infolist()),
                 archive_size=path.stat().st_size,
                 expected_metadata=expected_metadata,
@@ -292,9 +400,25 @@ def _validate_wheel_metadata(path: Path, *, project: str, version: str) -> None:
                 require_single_root=False,
                 reserved_root_suffix=".dist-info",
             )
-            payload = archive.read(metadata)
+            payload: bytes | None = None
+            for member in members:
+                info = member.source
+                if not isinstance(info, zipfile.ZipInfo):
+                    raise ReleaseContractError("distribution archive mismatch")
+                _validate_wheel_local_header(archive, info)
+                if member.is_file:
+                    with archive.open(info) as handle:
+                        member_payload = _read_regular_member(
+                            handle,
+                            expected_size=member.size,
+                            capture=member is metadata,
+                        )
+                    if member is metadata:
+                        payload = member_payload
     except (OSError, KeyError, RuntimeError, NotImplementedError, zipfile.BadZipFile) as error:
         raise ReleaseContractError("distribution archive mismatch") from error
+    if payload is None:
+        raise ReleaseContractError("distribution archive mismatch")
     _validate_metadata(payload, project=project, version=version)
 
 
@@ -303,7 +427,7 @@ def _validate_sdist_metadata(path: Path, *, project: str, version: str) -> None:
     expected_metadata = f"{expected_root}/PKG-INFO"
     try:
         with tarfile.open(path, "r:gz") as archive:
-            metadata = _validate_archive_members(
+            metadata, members = _validate_archive_members(
                 (
                     _ArchiveMember(
                         path=member.name,
@@ -321,12 +445,25 @@ def _validate_sdist_metadata(path: Path, *, project: str, version: str) -> None:
                 expected_root=expected_root,
                 require_single_root=True,
             )
-            handle = archive.extractfile(metadata)
-            if handle is None:
-                raise ReleaseContractError("distribution metadata mismatch")
-            payload = handle.read(ARCHIVE_MAX_METADATA_SIZE + 1)
+            payload: bytes | None = None
+            for member in members:
+                if not member.is_file:
+                    continue
+                handle = archive.extractfile(member.source)
+                if handle is None:
+                    raise ReleaseContractError("distribution archive mismatch")
+                with handle:
+                    member_payload = _read_regular_member(
+                        handle,
+                        expected_size=member.size,
+                        capture=member is metadata,
+                    )
+                if member is metadata:
+                    payload = member_payload
     except (OSError, EOFError, tarfile.TarError) as error:
         raise ReleaseContractError("distribution archive mismatch") from error
+    if payload is None:
+        raise ReleaseContractError("distribution archive mismatch")
     _validate_metadata(payload, project=project, version=version)
 
 
@@ -681,9 +818,9 @@ def _discover_pending_assets(
     ownership_marker: str,
     known_ids: set[int],
 ) -> tuple[list[dict[str, object]], bool]:
-    """Recover exact marker-bound POST results; preserve any drifted contender."""
+    """Recover only one unambiguous marker-bound POST result."""
 
-    recovered: dict[int, dict[str, object]] = {}
+    recovered: dict[str, object] | None = None
     complete = True
     saw_successful_recapture = False
     for _ in range(ROLLBACK_MAX_ATTEMPTS):
@@ -699,18 +836,24 @@ def _discover_pending_assets(
             and asset.get("id") not in known_ids
             and asset.get("label") == ownership_marker
         ]
-        for asset in marker_assets:
-            if not _asset_matches_expected(asset, expected, ownership_marker):
-                complete = False
-                continue
-            recorded = _record_uploaded_asset(asset)
-            asset_id = recorded["id"]
-            previous = recovered.get(asset_id)
-            if previous is not None and not _asset_identity_matches(recorded, previous):
-                complete = False
-                continue
-            recovered[asset_id] = recorded
-    return list(recovered.values()), complete and saw_successful_recapture
+        if len(marker_assets) > 1:
+            complete = False
+            continue
+        if not marker_assets:
+            continue
+        asset = marker_assets[0]
+        if not _asset_matches_expected(asset, expected, ownership_marker):
+            complete = False
+            continue
+        recorded = _record_uploaded_asset(asset)
+        if recovered is not None and not _asset_identity_matches(recorded, recovered):
+            complete = False
+            continue
+        recovered = recorded
+    discovery_complete = complete and saw_successful_recapture
+    if not discovery_complete or recovered is None:
+        return [], discovery_complete
+    return [recovered], True
 
 
 def _rollback_owned_asset(
