@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.4.1](https://github.com/dcc-mcp/dcc-mcp-material-maker/compare/v0.4.0...v0.4.1) (2026-08-28)
+
+
+### Bug Fixes
+
+* **ci:** bind release publication identity ([0f87644](https://github.com/dcc-mcp/dcc-mcp-material-maker/commit/0f876444f7092bdc755b750061d6c19d0014d3bb))
+* **ci:** harden release archive recovery ([ac49227](https://github.com/dcc-mcp/dcc-mcp-material-maker/commit/ac492279d5500261d01022793855105c6c20d6fb))
+* **ci:** make release publication fail closed ([0b81e65](https://github.com/dcc-mcp/dcc-mcp-material-maker/commit/0b81e6506f13c63d81d5a4a4695cb792c7925830))
+* enforce canonical wheel metadata ([2ce41dc](https://github.com/dcc-mcp/dcc-mcp-material-maker/commit/2ce41dc120d0bd6cb3fb7db37f15ed8c5e12546e))
+* harden release archive and rollback guards ([35f404e](https://github.com/dcc-mcp/dcc-mcp-material-maker/commit/35f404e3525e3728a3bf15ab1c2594fba856e1b2))
+* harden release publication provenance ([82592a0](https://github.com/dcc-mcp/dcc-mcp-material-maker/commit/82592a010b41cf90ddfbd92e3f3dc29bdc736d0b))
+* **release:** enforce final publication integrity ([46d57c7](https://github.com/dcc-mcp/dcc-mcp-material-maker/commit/46d57c787c88f31f3b9f9fe442fdf1239cc2e684))
+* validate wheel data descriptors ([c576ab1](https://github.com/dcc-mcp/dcc-mcp-material-maker/commit/c576ab12636b640255fe149efa54ef2c1ebfa600))
+* validate ZIP64 data descriptors ([70ca725](https://github.com/dcc-mcp/dcc-mcp-material-maker/commit/70ca72566a5f41ba7615760b77cfcb386673ae06))
+
 ## [0.4.0](https://github.com/dcc-mcp/dcc-mcp-material-maker/compare/v0.3.1...v0.4.0) (2026-08-25)
 
 
