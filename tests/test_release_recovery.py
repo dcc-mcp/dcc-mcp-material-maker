@@ -10,7 +10,10 @@ from types import SimpleNamespace
 import pytest
 import yaml
 from test_release_guard import (
+    ARTIFACT_DIGEST,
+    ARTIFACT_ID,
     PROJECT,
+    RUN_ID,
     SHA,
     TAG,
     VERSION,
@@ -557,6 +560,7 @@ def test_pax_override_decoys_are_validated_before_normalized_members(
         create_manifest(dist, project=PROJECT, version=VERSION)
 
 
+REPOSITORY = "dcc-mcp/dcc-mcp-material-maker"
 NEW_DRAFT_ID = 99001
 
 
@@ -738,3 +742,64 @@ def test_list_releases_stops_paging_on_a_short_page(monkeypatch) -> None:
     assert urls == [
         "https://api.github.com/repos/dcc-mcp/dcc-mcp-material-maker/releases?per_page=100&page=1"
     ]
+
+
+def _artifact_metadata_head(head_sha: str) -> dict[str, object]:
+    metadata = _artifact_metadata()
+    workflow_run = metadata["workflow_run"]
+    assert isinstance(workflow_run, dict)
+    workflow_run["head_sha"] = head_sha
+    return metadata
+
+
+def test_backfill_artifact_may_declare_the_run_head_it_was_built_from() -> None:
+    maintenance_sha = "8" * 40
+
+    release_guard.verify_artifact_metadata(
+        _artifact_metadata_head(maintenance_sha),
+        repository=REPOSITORY,
+        artifact_id=ARTIFACT_ID,
+        artifact_digest=ARTIFACT_DIGEST,
+        source_sha=SHA,
+        run_id=RUN_ID,
+        name="release-distributions",
+        head_sha=maintenance_sha,
+    )
+
+
+def test_artifact_without_a_declared_run_head_still_requires_the_released_source() -> None:
+    maintenance_sha = "8" * 40
+
+    with pytest.raises(ReleaseContractError, match="artifact source drift"):
+        release_guard.verify_artifact_metadata(
+            _artifact_metadata_head(maintenance_sha),
+            repository=REPOSITORY,
+            artifact_id=ARTIFACT_ID,
+            artifact_digest=ARTIFACT_DIGEST,
+            source_sha=SHA,
+            run_id=RUN_ID,
+            name="release-distributions",
+        )
+
+
+def test_declared_run_head_does_not_relax_any_other_artifact_binding() -> None:
+    maintenance_sha = "8" * 40
+    for changes in (
+        {"id": ARTIFACT_ID + 1},
+        {"digest": f"sha256:{'b' * 64}"},
+        {"expired": True},
+        {"workflow_run": {"id": RUN_ID + 1}},
+    ):
+        metadata = _artifact_metadata_head(maintenance_sha)
+        metadata.update(changes)
+        with pytest.raises(ReleaseContractError):
+            release_guard.verify_artifact_metadata(
+                metadata,
+                repository=REPOSITORY,
+                artifact_id=ARTIFACT_ID,
+                artifact_digest=ARTIFACT_DIGEST,
+                source_sha=SHA,
+                run_id=RUN_ID,
+                name="release-distributions",
+                head_sha=maintenance_sha,
+            )
