@@ -13,7 +13,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 EXPECTED_WORKFLOW_SEMANTIC_SHA256 = (
-    "7ffdf5bd365c986ddc340ca1f62d6fac4621cd966567e92d0782be656ec7a088"
+    "a61b56c47a6e430ce703ffafc83b83d91e3f594762e2c50d098ea2b0af45963f"
 )
 
 PINNED_ACTIONS = {
@@ -36,10 +36,6 @@ DETECT_NEEDED = "steps.detect.outputs.release_needed == 'true'"
 STAGE_NEEDED = DETECT_NEEDED + " || github.event_name == 'workflow_dispatch'"
 PUSH_ONLY = "github.event_name == 'push'"
 DISPATCH_ONLY = "github.event_name == 'workflow_dispatch'"
-STAGE_GATE = (
-    "always() && (github.event_name == 'workflow_dispatch' "
-    "|| needs.release-please.result == 'success')"
-)
 ALWAYS = "always()"
 FULL_SHA_ACTION = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$")
 MUTATING_RUN_PATTERNS = (
@@ -164,10 +160,9 @@ def assert_release_workflow_contract(document: dict[str, Any]) -> None:
     pypi = jobs["publish-pypi"]
     assets = jobs["publish-github-assets"]
     finalize = jobs["finalize-release"]
-    assert set(release) == {"if", "runs-on", "timeout-minutes", "permissions", "steps"}
+    assert set(release) == {"runs-on", "timeout-minutes", "permissions", "steps"}
     assert set(stage) == {
         "needs",
-        "if",
         "runs-on",
         "timeout-minutes",
         "permissions",
@@ -241,7 +236,7 @@ def assert_release_workflow_contract(document: dict[str, Any]) -> None:
     assert stage["outputs"]["artifact_digest"] == "${{ steps.upload.outputs['artifact-digest'] }}"
     assert stage["outputs"]["run_id"] == "${{ github.run_id }}"
 
-    allowed_job_ifs = {None, RELEASE_NEEDED, PUSH_ONLY, STAGE_GATE}
+    allowed_job_ifs = {None, RELEASE_NEEDED}
     allowed_step_ifs = {None, DETECT_NEEDED, PUSH_ONLY, DISPATCH_ONLY, STAGE_NEEDED, ALWAYS}
     all_text: list[str] = []
     action_counts = {repository: 0 for repository in PINNED_ACTIONS}
@@ -581,11 +576,13 @@ def test_dispatch_path_builds_from_the_tag_and_runs_the_reviewed_guard() -> None
 def test_dispatch_path_keeps_the_push_gate_and_publish_gate_intact() -> None:
     jobs = _load_workflow()["jobs"]
 
-    # release-please only detects a version transition on a push to main.
-    assert jobs["release-please"]["if"] == PUSH_ONLY
-    assert jobs["stage-release"]["if"] == STAGE_GATE
-    # stage-release still refuses to run when release-please failed on push.
-    assert "needs.release-please.result == 'success'" in jobs["stage-release"]["if"]
+    # release-please only detects a version transition on a push to main, but
+    # the job itself still succeeds when its step is skipped: a job that runs
+    # through always() does not expose its outputs to job-level if conditions.
+    release_action = _single_action(jobs["release-please"], "googleapis/release-please-action")
+    assert release_action["if"] == PUSH_ONLY
+    assert jobs["release-please"].get("if") is None
+    assert jobs["stage-release"].get("if") is None
     for name in ("publish-pypi", "publish-github-assets", "finalize-release"):
         assert jobs[name]["if"] == RELEASE_NEEDED
     assert jobs["stage-release"]["outputs"]["release_needed"] == (
