@@ -140,6 +140,10 @@ class ArtifactBinding:
     source_sha: str
     run_id: int
     name: str
+    # Empty for the normal release path, where the publishing workflow runs at
+    # the released commit itself. A backfill runs on a maintenance ref while it
+    # builds from the tag, so it declares the run head explicitly.
+    head_sha: str = ""
 
 
 def _canonical_json(payload: object) -> bytes:
@@ -1605,9 +1609,16 @@ def verify_artifact_metadata(
     source_sha: str,
     run_id: int,
     name: str,
+    head_sha: str = "",
     now: datetime | None = None,
 ) -> None:
-    """Verify one immutable Actions artifact against its server-side provenance."""
+    """Verify one immutable Actions artifact against its server-side provenance.
+
+    ``head_sha`` defaults to the released source sha. Only a backfill passes it:
+    such a run is dispatched on a maintenance ref and builds from the tag, so
+    its head commit is not the released commit. Every other binding stays
+    exact: the artifact must belong to this run, this repository and this digest.
+    """
 
     _validate_repository(repository)
     _validate_source_sha(source_sha)
@@ -1648,7 +1659,9 @@ def verify_artifact_metadata(
         or workflow_run.get("head_repository_id") != repository_id
     ):
         raise ReleaseContractError("artifact repository drift")
-    if workflow_run.get("head_sha") != source_sha:
+    expected_head_sha = head_sha or source_sha
+    _validate_source_sha(expected_head_sha)
+    if workflow_run.get("head_sha") != expected_head_sha:
         raise ReleaseContractError("artifact source drift")
     if workflow_run.get("head_branch") != "main":
         raise ReleaseContractError("artifact source branch drift")
@@ -1667,6 +1680,7 @@ def _recapture_bound_artifact(
         source_sha=binding.source_sha,
         run_id=binding.run_id,
         name=binding.name,
+        head_sha=binding.head_sha,
     )
 
 
@@ -2146,6 +2160,7 @@ def _common_live(
         source_sha=args.source_sha,
         run_id=args.run_id,
         name=args.artifact_name,
+        head_sha=args.artifact_head_sha,
     )
     ref_payload, release_payload = client.recapture_release(snapshot)
     return snapshot, manifest, ref_payload, release_payload
@@ -2207,6 +2222,7 @@ def _verify_artifact_command(args: argparse.Namespace) -> None:
         source_sha=args.source_sha,
         run_id=args.run_id,
         name=args.artifact_name,
+        head_sha=args.artifact_head_sha,
     )
 
 
@@ -2234,6 +2250,7 @@ def _publish_assets_command(args: argparse.Namespace) -> None:
             source_sha=args.source_sha,
             run_id=args.run_id,
             name=args.artifact_name,
+            head_sha=args.artifact_head_sha,
         ),
     )
 
@@ -2289,6 +2306,14 @@ def _parser() -> argparse.ArgumentParser:
     verify_common.add_argument("--artifact-digest", required=True)
     verify_common.add_argument("--run-id", required=True, type=int)
     verify_common.add_argument("--artifact-name", default="release-distributions")
+    verify_common.add_argument(
+        "--artifact-head-sha",
+        default="",
+        help=(
+            "Commit the publishing workflow ran at, when it is not the released "
+            "source sha; only a backfill runs from a different ref than it builds."
+        ),
+    )
 
     verify = subparsers.add_parser("verify", parents=[common, verify_common])
     verify.add_argument("--expect-no-assets", action="store_true", required=True)
@@ -2304,6 +2329,14 @@ def _parser() -> argparse.ArgumentParser:
     verify_artifact.add_argument("--artifact-digest", required=True)
     verify_artifact.add_argument("--run-id", required=True, type=int)
     verify_artifact.add_argument("--artifact-name", default="release-distributions")
+    verify_artifact.add_argument(
+        "--artifact-head-sha",
+        default="",
+        help=(
+            "Commit the publishing workflow ran at, when it is not the released "
+            "source sha; only a backfill runs from a different ref than it builds."
+        ),
+    )
     verify_artifact.add_argument(
         "--github-token",
         default=os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or "",
