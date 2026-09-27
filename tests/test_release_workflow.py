@@ -13,7 +13,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 EXPECTED_WORKFLOW_SEMANTIC_SHA256 = (
-    "6e7673ecf4bca8b9ddb1aa2f48176b4ec04cf3290f416db38710655546147d50"
+    "6c243a944296204a55713c641e936944d8bbef8a656041b5c98c343725b0a677"
 )
 
 PINNED_ACTIONS = {
@@ -33,6 +33,13 @@ EXPECTED_JOBS = {
 }
 RELEASE_NEEDED = "needs.stage-release.outputs.release_needed == 'true'"
 DETECT_NEEDED = "steps.detect.outputs.release_needed == 'true'"
+STAGE_NEEDED = DETECT_NEEDED + " || github.event_name == 'workflow_dispatch'"
+PUSH_ONLY = "github.event_name == 'push'"
+DISPATCH_ONLY = "github.event_name == 'workflow_dispatch'"
+STAGE_GATE = (
+    "always() && (github.event_name == 'workflow_dispatch' "
+    "|| needs.release-please.result == 'success')"
+)
 FULL_SHA_ACTION = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$")
 MUTATING_RUN_PATTERNS = (
     re.compile(r"(^|\s)git\s+push(?:\s|$)"),
@@ -41,7 +48,7 @@ MUTATING_RUN_PATTERNS = (
     re.compile(r"(^|\s)(?:python\s+-m\s+)?twine\s+upload(?:\s|$)"),
 )
 EXPECTED_FINALIZE_COMMAND = (
-    "python tools/release_guard.py finalize "
+    'python "$GUARD" finalize '
     '--repository "${{ github.repository }}" '
     '--tag "${{ needs.stage-release.outputs.tag_name }}" '
     '--source-sha "${{ needs.stage-release.outputs.source_sha }}" '
@@ -50,7 +57,8 @@ EXPECTED_FINALIZE_COMMAND = (
     '--expected-snapshot-sha256 "${{ needs.stage-release.outputs.snapshot_sha256 }}" '
     '--artifact-id "${{ needs.stage-release.outputs.artifact_id }}" '
     '--artifact-digest "${{ needs.stage-release.outputs.artifact_digest }}" '
-    '--run-id "${{ needs.stage-release.outputs.run_id }}"'
+    '--run-id "${{ needs.stage-release.outputs.run_id }}" '
+    '--artifact-head-sha "${{ github.sha }}"'
 )
 
 
@@ -78,10 +86,20 @@ def _canonical_shell(value: object) -> str:
 
 
 def _single_action(job: dict[str, Any], repository: str) -> dict[str, Any]:
-    matches = [
-        step for step in _steps(job) if str(step.get("uses", "")).startswith(f"{repository}@")
-    ]
+    matches = _matching_actions(job, repository)
     assert len(matches) == 1
+    return matches[0]
+
+
+def _matching_actions(job: dict[str, Any], repository: str) -> list[dict[str, Any]]:
+    return [step for step in _steps(job) if str(step.get("uses", "")).startswith(f"{repository}@")]
+
+
+def _first_action(job: dict[str, Any], repository: str) -> dict[str, Any]:
+    """The job may check out a second ref for the dispatch guard path."""
+
+    matches = _matching_actions(job, repository)
+    assert 1 <= len(matches) <= 2
     return matches[0]
 
 
@@ -118,7 +136,24 @@ def assert_release_workflow_contract(document: dict[str, Any]) -> None:
     assert hashlib.sha256(semantic_bytes).hexdigest() == EXPECTED_WORKFLOW_SEMANTIC_SHA256
     assert set(document) == {"name", "on", "permissions", "jobs"}
     assert document["name"] == "Release"
-    assert document["on"] == {"push": {"branches": ["main"]}}
+    assert document["on"] == {
+        "push": {"branches": ["main"]},
+        "workflow_dispatch": {
+            "inputs": {
+                "tag_name": {
+                    "description": "Existing release tag to publish, for example v0.4.1",
+                    "required": "true",
+                    "type": "string",
+                },
+                "guard_ref": {
+                    "description": "Ref that provides tools/release_guard.py",
+                    "required": "false",
+                    "type": "string",
+                    "default": "main",
+                },
+            }
+        },
+    }
     assert document["permissions"] == {"contents": "read"}
     jobs = document["jobs"]
     assert isinstance(jobs, dict) and set(jobs) == EXPECTED_JOBS
@@ -128,12 +163,14 @@ def assert_release_workflow_contract(document: dict[str, Any]) -> None:
     pypi = jobs["publish-pypi"]
     assets = jobs["publish-github-assets"]
     finalize = jobs["finalize-release"]
-    assert set(release) == {"runs-on", "timeout-minutes", "permissions", "steps"}
+    assert set(release) == {"if", "runs-on", "timeout-minutes", "permissions", "steps"}
     assert set(stage) == {
         "needs",
+        "if",
         "runs-on",
         "timeout-minutes",
         "permissions",
+        "env",
         "outputs",
         "steps",
     }
@@ -144,6 +181,7 @@ def assert_release_workflow_contract(document: dict[str, Any]) -> None:
         "timeout-minutes",
         "environment",
         "permissions",
+        "env",
         "steps",
     }
     for job in (assets, finalize):
@@ -153,6 +191,7 @@ def assert_release_workflow_contract(document: dict[str, Any]) -> None:
             "runs-on",
             "timeout-minutes",
             "permissions",
+            "env",
             "steps",
         }
     assert _needs(stage) == ["release-please"]
@@ -202,8 +241,8 @@ def assert_release_workflow_contract(document: dict[str, Any]) -> None:
     assert stage["outputs"]["artifact_digest"] == "${{ steps.upload.outputs['artifact-digest'] }}"
     assert stage["outputs"]["run_id"] == "${{ github.run_id }}"
 
-    allowed_job_ifs = {None, RELEASE_NEEDED}
-    allowed_step_ifs = {None, DETECT_NEEDED}
+    allowed_job_ifs = {None, RELEASE_NEEDED, PUSH_ONLY, STAGE_GATE}
+    allowed_step_ifs = {None, DETECT_NEEDED, PUSH_ONLY, DISPATCH_ONLY, STAGE_NEEDED}
     all_text: list[str] = []
     action_counts = {repository: 0 for repository in PINNED_ACTIONS}
     for job in jobs.values():
@@ -221,22 +260,26 @@ def assert_release_workflow_contract(document: dict[str, Any]) -> None:
             else:
                 assert set(step) <= {"id", "name", "if", "run", "env"}
                 command = _canonical_shell(step.get("run"))
-                expected_env = (
-                    {"GH_TOKEN": "${{ github.token }}"}
-                    if "tools/release_guard.py" in command
-                    and any(
-                        word in command
-                        for word in (" stage ", "verify-artifact", "publish-assets", " finalize ")
-                    )
-                    else None
+                mutating_guard = '"$GUARD"' in command and any(
+                    word in command
+                    for word in (" stage ", "verify-artifact", "publish-assets", " finalize ")
                 )
+                expected_env = None
+                if mutating_guard:
+                    expected_env = {"GH_TOKEN": "${{ github.token }}"}
+                    if " stage " in command:
+                        expected_env["RELEASE_TAG"] = (
+                            "${{ github.event_name == 'workflow_dispatch' && inputs.tag_name"
+                            " || steps.detect.outputs.tag_name }}"
+                        )
+                        expected_env["RELEASE_SHA"] = "${{ steps.resolve.outputs.source_sha }}"
                 assert step.get("env") == expected_env
                 for pattern in MUTATING_RUN_PATTERNS:
                     assert pattern.search(command) is None
                 all_text.append(command)
     assert action_counts == {
         "googleapis/release-please-action": 1,
-        "actions/checkout": 4,
+        "actions/checkout": 8,
         "actions/setup-python": 4,
         "actions/upload-artifact": 1,
         "actions/download-artifact": 3,
@@ -251,14 +294,18 @@ def assert_release_workflow_contract(document: dict[str, Any]) -> None:
         "config-file": "release-please-config.json",
         "manifest-file": ".release-please-manifest.json",
     }
-    stage_checkout = _single_action(stage, "actions/checkout")
+    stage_checkout = _steps(stage)[0]
+    assert str(stage_checkout.get("uses", "")).startswith("actions/checkout@")
     assert stage_checkout["with"] == {
-        "ref": "${{ github.sha }}",
-        "fetch-depth": "2",
+        "ref": "${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.sha }}",
+        "fetch-depth": "${{ github.event_name == 'workflow_dispatch' && '1' || '2' }}",
         "persist-credentials": "false",
     }
-    assert _steps(stage)[0] is stage_checkout
-    assert str(_steps(stage)[1].get("uses", "")).startswith("actions/setup-python@")
+    guard_checkout = _steps(stage)[1]
+    assert str(guard_checkout.get("uses", "")).startswith("actions/checkout@")
+    assert guard_checkout["if"] == DISPATCH_ONLY
+    assert guard_checkout["with"]["path"] == ".release-guard"
+    assert guard_checkout["with"]["ref"] == "${{ inputs.guard_ref }}"
     assert (
         _steps(stage).index(_run_step(stage, " detect-release "))
         < _steps(stage).index(_run_step(stage, " -m build"))
@@ -275,7 +322,16 @@ def assert_release_workflow_contract(document: dict[str, Any]) -> None:
         "overwrite": "false",
     }
     for job in (pypi, assets, finalize):
-        checkout = _single_action(job, "actions/checkout")
+        checkout = _steps(job)[0]
+        assert str(checkout.get("uses", "")).startswith("actions/checkout@")
+        guard_checkout = _steps(job)[1]
+        assert str(guard_checkout.get("uses", "")).startswith("actions/checkout@")
+        assert guard_checkout["if"] == DISPATCH_ONLY
+        assert guard_checkout["with"]["path"] == ".release-guard"
+        assert job["env"]["GUARD"] == (
+            "${{ github.event_name == 'workflow_dispatch' && "
+            "'.release-guard/tools/release_guard.py' || 'tools/release_guard.py' }}"
+        )
         assert checkout["with"] == {
             "ref": "${{ needs.stage-release.outputs.source_sha }}",
             "fetch-depth": "1",
@@ -331,7 +387,7 @@ def test_contract_ignores_comment_decoys_but_rejects_extra_mutation_paths() -> N
 
 def test_contract_rejects_allowlisted_action_at_untrusted_sha() -> None:
     document = _load_workflow()
-    checkout = _single_action(document["jobs"]["stage-release"], "actions/checkout")
+    checkout = _first_action(document["jobs"]["stage-release"], "actions/checkout")
     checkout["uses"] = "actions/checkout@" + "f" * 40
     with pytest.raises(AssertionError):
         assert_release_workflow_contract(document)
@@ -355,7 +411,7 @@ def test_contract_rejects_alternate_mutation_and_credential_routes(case: str) ->
     document = _load_workflow()
     jobs = document["jobs"]
     stage = _run_step(jobs["stage-release"], " stage --repository ")
-    checkout = _single_action(jobs["stage-release"], "actions/checkout")
+    checkout = _first_action(jobs["stage-release"], "actions/checkout")
     if case == "always":
         _single_action(jobs["publish-pypi"], "pypa/gh-action-pypi-publish")["if"] = "always()"
     elif case == "git-push":
@@ -405,7 +461,7 @@ def test_contract_rejects_finalize_pypi_recheck_mutants(case: str) -> None:
             -1,
             {
                 "name": "earlier verifier",
-                "run": "python tools/release_guard.py pypi-verify --source-sha earlier",
+                "run": 'python "$GUARD" pypi-verify --source-sha earlier',
             },
         )
         step["run"] = "echo finalize"
@@ -482,3 +538,61 @@ def test_workflow_binds_exact_artifact_and_release_identity_for_every_consumer()
             "run_id",
         ):
             assert f"needs.stage-release.outputs.{binding}" in text
+
+
+def test_dispatch_path_builds_from_the_tag_and_runs_the_reviewed_guard() -> None:
+    """A backfill must build the tag, not the maintenance ref it runs on."""
+
+    jobs = _load_workflow()["jobs"]
+    stage = jobs["stage-release"]
+
+    checkout, guard_checkout = _matching_actions(stage, "actions/checkout")
+    assert checkout["with"]["ref"] == (
+        "${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.sha }}"
+    )
+    assert guard_checkout["if"] == DISPATCH_ONLY
+    assert guard_checkout["with"]["ref"] == "${{ inputs.guard_ref }}"
+    assert guard_checkout["with"]["path"] == ".release-guard"
+
+    stage_step = _run_step(stage, " stage --repository ")
+    assert stage_step["env"]["RELEASE_TAG"] == (
+        "${{ github.event_name == 'workflow_dispatch' && inputs.tag_name"
+        " || steps.detect.outputs.tag_name }}"
+    )
+    assert stage_step["env"]["RELEASE_SHA"] == "${{ steps.resolve.outputs.source_sha }}"
+
+    commands = [_canonical_shell(step.get("run")) for step in _steps(stage)]
+    joined = "\n".join(commands)
+    # The guard is staged outside the tree so the sdist cannot absorb it.
+    assert "mv .release-guard/tools/release_guard.py" in joined
+    assert "rm -rf .release-guard" in joined
+    assert stage["env"]["GUARD"] == (
+        "${{ github.event_name == 'workflow_dispatch'"
+        " && format('{0}/release-guard/release_guard.py', runner.temp)"
+        " || 'tools/release_guard.py' }}"
+    )
+
+
+def test_dispatch_path_keeps_the_push_gate_and_publish_gate_intact() -> None:
+    jobs = _load_workflow()["jobs"]
+
+    # release-please only detects a version transition on a push to main.
+    assert jobs["release-please"]["if"] == PUSH_ONLY
+    assert jobs["stage-release"]["if"] == STAGE_GATE
+    # stage-release still refuses to run when release-please failed on push.
+    assert "needs.release-please.result == 'success'" in jobs["stage-release"]["if"]
+    for name in ("publish-pypi", "publish-github-assets", "finalize-release"):
+        assert jobs[name]["if"] == RELEASE_NEEDED
+    assert jobs["stage-release"]["outputs"]["release_needed"] == (
+        "${{ steps.detect.outputs.release_needed == 'true'"
+        " || github.event_name == 'workflow_dispatch' }}"
+    )
+
+
+def test_every_consumer_binds_the_run_head_for_the_dispatch_path() -> None:
+    """A dispatched run builds the tag but runs on main, so it declares the head."""
+
+    jobs = _load_workflow()["jobs"]
+    for name in ("publish-pypi", "publish-github-assets", "finalize-release"):
+        commands = "\n".join(_canonical_shell(step.get("run")) for step in _steps(jobs[name]))
+        assert '--artifact-head-sha "${{ github.sha }}"' in commands
