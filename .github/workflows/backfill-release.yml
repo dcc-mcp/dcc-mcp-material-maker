@@ -136,6 +136,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.stage-release.outputs.artifact_id }}
           path: .
+          merge-multiple: true
       - name: Require absent or exact-hash PyPI state
         run: >-
           python .release-guard/tools/release_guard.py pypi-preflight
@@ -191,6 +192,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.stage-release.outputs.artifact_id }}
           path: .
+          merge-multiple: true
       - name: Resume exact owned draft assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -244,6 +246,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.stage-release.outputs.artifact_id }}
           path: .
+          merge-multiple: true
       - name: Reverify exact PyPI state and publish release
         env:
           GH_TOKEN: ${{ github.token }}
