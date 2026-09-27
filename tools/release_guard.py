@@ -20,6 +20,7 @@ import struct
 import subprocess
 import sys
 import tarfile
+import time
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -44,6 +45,10 @@ ARCHIVE_MAX_MEMBER_SIZE = 16 * 1024 * 1024
 ARCHIVE_MAX_TOTAL_SIZE = 64 * 1024 * 1024
 ARCHIVE_MAX_COMPRESSION_RATIO = 100
 ARCHIVE_MAX_RAW_TAR_SIZE = ARCHIVE_MAX_TOTAL_SIZE + (ARCHIVE_MAX_MEMBERS + 2) * 512
+RELEASE_OBSERVABILITY_ATTEMPTS = 4
+RELEASE_OBSERVABILITY_DELAY_SECONDS = 2.0
+RELEASE_LIST_PAGE_SIZE = 100
+RELEASE_LIST_MAX_PAGES = 10
 APPROVED_REQUIRES_PYTHON = ">=3.9"
 APPROVED_REQUIRES_DIST = frozenset(
     {
@@ -1675,14 +1680,14 @@ class GitHubReleaseClient:
         self.repository = repository
         self._token = token
 
-    def _json_request(
+    def _request(
         self,
         url: str,
         *,
         method: str = "GET",
         data: bytes | None = None,
         content_type: str | None = None,
-    ) -> dict[str, object]:
+    ) -> object:
         headers = {
             "Accept": "application/vnd.github+json",
             "Authorization": f"Bearer {self._token}",
@@ -1697,9 +1702,26 @@ class GitHubReleaseClient:
                 payload = json.load(response)
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as error:
             raise ReleaseContractError(f"GitHub {method} request failed") from error
+        return payload
+
+    def _json_request(
+        self,
+        url: str,
+        *,
+        method: str = "GET",
+        data: bytes | None = None,
+        content_type: str | None = None,
+    ) -> dict[str, object]:
+        payload = self._request(url, method=method, data=data, content_type=content_type)
         if not isinstance(payload, dict):
             raise ReleaseContractError("GitHub response was not an object")
         return payload
+
+    def _json_list_request(self, url: str) -> list[dict[str, object]]:
+        payload = self._request(url)
+        if not isinstance(payload, list) or any(not isinstance(item, dict) for item in payload):
+            raise ReleaseContractError("GitHub response was not a list of objects")
+        return list(payload)
 
     def _optional_json_request(self, url: str) -> dict[str, object] | None:
         try:
@@ -1718,11 +1740,66 @@ class GitHubReleaseClient:
         )
 
     def recapture_release_by_tag(self, tag: str) -> dict[str, object] | None:
+        """Resolve a *published* release by tag.
+
+        The endpoint returns 404 for draft releases, so it must never be used
+        to observe a draft this guard just staged. Use :meth:`find_release_by_tag`
+        for create-or-resume lookups.
+        """
         _validate_tag(tag)
         encoded_tag = urllib.parse.quote(tag, safe="")
         return self._optional_json_request(
             f"https://api.github.com/repos/{self.repository}/releases/tags/{encoded_tag}"
         )
+
+    def recapture_release_by_id(self, release_id: int) -> dict[str, object] | None:
+        if type(release_id) is not int or release_id <= 0:
+            raise ReleaseContractError("invalid release identity")
+        return self._optional_json_request(
+            f"https://api.github.com/repos/{self.repository}/releases/{release_id}"
+        )
+
+    def list_releases(self) -> list[dict[str, object]]:
+        """List releases, drafts included.
+
+        The listing endpoint is the only read that exposes draft releases, which
+        makes it the source of truth for create-or-resume staging.
+        """
+        releases: list[dict[str, object]] = []
+        for page in range(1, RELEASE_LIST_MAX_PAGES + 1):
+            query = urllib.parse.urlencode({"per_page": RELEASE_LIST_PAGE_SIZE, "page": page})
+            page_releases = self._json_list_request(
+                f"https://api.github.com/repos/{self.repository}/releases?{query}"
+            )
+            releases.extend(page_releases)
+            if len(page_releases) < RELEASE_LIST_PAGE_SIZE:
+                break
+        return releases
+
+    def find_release_by_tag(self, tag: str) -> dict[str, object] | None:
+        """Resolve a release by exact tag name, drafts included.
+
+        A staging attempt that failed to observe its own create leaves a draft
+        behind, and a retry that cannot see it creates another one. Resuming the
+        oldest candidate keeps the choice deterministic while duplicates exist.
+        """
+        _validate_tag(tag)
+        candidates = [release for release in self.list_releases() if release.get("tag_name") == tag]
+        if not candidates:
+            return None
+        drafts = [release for release in candidates if release.get("draft") is True]
+        pool = drafts or candidates
+        return min(pool, key=lambda release: release["id"] if type(release["id"]) is int else 0)
+
+    def observe_release_by_id(self, release_id: int) -> dict[str, object] | None:
+        """Read a release back by id, allowing bounded read-after-write latency."""
+        for attempt in range(RELEASE_OBSERVABILITY_ATTEMPTS):
+            payload = self.recapture_release_by_id(release_id)
+            if payload is not None:
+                return payload
+            if attempt + 1 < RELEASE_OBSERVABILITY_ATTEMPTS:
+                time.sleep(RELEASE_OBSERVABILITY_DELAY_SECONDS)
+        return None
 
     def create_tag(self, tag: str, source_sha: str) -> dict[str, object]:
         _validate_tag(tag)
@@ -1919,7 +1996,7 @@ def _stage_release_command(args: argparse.Namespace) -> None:
     manifest = create_manifest(args.dist_dir, project=args.project, version=version)
     client = GitHubReleaseClient(args.repository, args.github_token)
     ref_payload = client.recapture_ref(args.tag)
-    release_payload = client.recapture_release_by_tag(args.tag)
+    release_payload = client.find_release_by_tag(args.tag)
     if ref_payload is None:
         if release_payload is not None:
             raise ReleaseContractError("release exists without its exact tag")
@@ -1929,10 +2006,11 @@ def _stage_release_command(args: argparse.Namespace) -> None:
         raise ReleaseContractError("staged tag creation was not observable")
     _validate_ref(ref_payload, tag=args.tag, source_sha=args.source_sha)
     if release_payload is None:
-        client.create_draft_release(args.tag, args.source_sha)
-        release_payload = client.recapture_release_by_tag(args.tag)
-    if release_payload is None:
-        raise ReleaseContractError("draft release creation was not observable")
+        created = client.create_draft_release(args.tag, args.source_sha)
+        release_id = created.get("id")
+        if type(release_id) is not int or release_id <= 0:
+            raise ReleaseContractError("draft release creation returned no identity")
+        release_payload = client.observe_release_by_id(release_id) or created
 
     if release_payload.get("draft") is True:
         snapshot = capture_staged_snapshot(

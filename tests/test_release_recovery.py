@@ -555,3 +555,186 @@ def test_pax_override_decoys_are_validated_before_normalized_members(
 
     with pytest.raises(ReleaseContractError, match="distribution archive mismatch"):
         create_manifest(dist, project=PROJECT, version=VERSION)
+
+
+NEW_DRAFT_ID = 99001
+
+
+def _draft_release_with_id(release_id: int) -> dict[str, object]:
+    repository = "dcc-mcp/dcc-mcp-material-maker"
+    return _draft_release(
+        id=release_id,
+        url=f"https://api.github.com/repos/{repository}/releases/{release_id}",
+        upload_url=(
+            f"https://uploads.github.com/repos/{repository}/releases/{release_id}"
+            "/assets{?name,label}"
+        ),
+    )
+
+
+class _FakeStageGitHub:
+    """Stands in for GitHubReleaseClient during resume staging.
+
+    It reproduces the endpoint behaviour this suite guards against: the tag
+    endpoint never resolves drafts, so a create that is not observed leaves a
+    draft behind for the next attempt to resume.
+    """
+
+    def __init__(
+        self,
+        *,
+        releases: list[dict[str, object]] | None = None,
+        ref: dict[str, object] | None = None,
+        observe: object = None,
+        without_tag: bool = False,
+    ) -> None:
+        self.releases: list[dict[str, object]] = list(releases or [])
+        self.ref = None if without_tag else (_ref() if ref is None else ref)
+        self.created: list[str] = []
+        self.observed: list[int] = []
+        self._observe = observe or (lambda _release_id: None)
+
+    def recapture_ref(self, _tag: str) -> dict[str, object] | None:
+        return self.ref
+
+    def create_tag(self, tag: str, _source_sha: str) -> dict[str, object] | None:
+        self.created.append(f"tag:{tag}")
+        if self.ref is None:
+            return None
+        return self.ref
+
+    def find_release_by_tag(self, tag: str) -> dict[str, object] | None:
+        for release in self.releases:
+            if release.get("tag_name") == tag:
+                return release
+        return None
+
+    def create_draft_release(self, tag: str, _source_sha: str) -> dict[str, object]:
+        self.created.append(f"draft:{tag}")
+        payload = _draft_release_with_id(NEW_DRAFT_ID)
+        self.releases.append(payload)
+        return payload
+
+    def observe_release_by_id(self, release_id: int) -> dict[str, object] | None:
+        self.observed.append(release_id)
+        return self._observe(release_id)
+
+
+def _stage_args(tmp_path: Path) -> SimpleNamespace:
+    return SimpleNamespace(
+        repository="dcc-mcp/dcc-mcp-material-maker",
+        tag=TAG,
+        source_sha=SHA,
+        dist_dir=_dist(tmp_path),
+        state_dir=tmp_path / "release",
+        project=PROJECT,
+        github_token="token",
+    )
+
+
+def _stage(tmp_path: Path, monkeypatch, github: _FakeStageGitHub) -> dict[str, str]:
+    output_path = tmp_path / "github-output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output_path))
+    monkeypatch.setattr(release_guard, "_verify_local_checkout", lambda _source_sha: None)
+    monkeypatch.setattr(release_guard, "GitHubReleaseClient", lambda *_args: github)
+    release_guard._stage_release_command(_stage_args(tmp_path))
+    values: dict[str, str] = {}
+    for line in output_path.read_text(encoding="utf-8").splitlines():
+        key, _, value = line.partition("=")
+        values[key] = value
+    return values
+
+
+def test_stage_resumes_an_existing_draft_instead_of_creating_another(tmp_path, monkeypatch) -> None:
+    draft = _draft_release(id=12345)
+    github = _FakeStageGitHub(releases=[draft])
+
+    def must_not_create(*_args, **_kwargs):
+        raise AssertionError("staging must resume the existing draft")
+
+    github.create_draft_release = must_not_create  # type: ignore[method-assign]
+
+    outputs = _stage(tmp_path, monkeypatch, github)
+
+    assert github.created == []
+    assert outputs["release_id"] == "12345"
+    assert outputs["tag_name"] == TAG
+    assert (tmp_path / "release" / "snapshot.json").is_file()
+
+
+def test_stage_creates_once_then_observes_the_draft_by_id(tmp_path, monkeypatch) -> None:
+    observations: list[dict[str, object] | None] = [None, _draft_release_with_id(NEW_DRAFT_ID)]
+    github = _FakeStageGitHub(observe=lambda _release_id: observations.pop(0))
+    monkeypatch.setattr(release_guard, "RELEASE_OBSERVABILITY_DELAY_SECONDS", 0.0)
+
+    outputs = _stage(tmp_path, monkeypatch, github)
+
+    assert github.created == [f"draft:{TAG}"]
+    assert github.observed == [NEW_DRAFT_ID]
+    assert outputs["release_id"] == str(NEW_DRAFT_ID)
+
+
+def test_stage_accepts_the_create_response_when_read_back_stays_empty(
+    tmp_path, monkeypatch
+) -> None:
+    github = _FakeStageGitHub()
+    monkeypatch.setattr(release_guard, "RELEASE_OBSERVABILITY_ATTEMPTS", 1)
+
+    outputs = _stage(tmp_path, monkeypatch, github)
+
+    assert github.created == [f"draft:{TAG}"]
+    assert outputs["release_id"] == str(NEW_DRAFT_ID)
+
+
+def test_stage_fails_closed_when_create_returns_no_identity(tmp_path, monkeypatch) -> None:
+    github = _FakeStageGitHub()
+    github.create_draft_release = lambda *_args: {"tag_name": TAG, "draft": True}  # type: ignore[method-assign]
+
+    with pytest.raises(ReleaseContractError, match="draft release creation returned no identity"):
+        _stage(tmp_path, monkeypatch, github)
+
+
+def test_stage_fails_closed_when_a_draft_exists_without_its_tag(tmp_path, monkeypatch) -> None:
+    github = _FakeStageGitHub(releases=[_draft_release(id=12345)], without_tag=True)
+
+    with pytest.raises(ReleaseContractError, match="release exists without its exact tag"):
+        _stage(tmp_path, monkeypatch, github)
+    assert github.created == []
+
+
+def test_find_release_by_tag_prefers_the_oldest_draft_among_duplicates(monkeypatch) -> None:
+    client = release_guard.GitHubReleaseClient("dcc-mcp/dcc-mcp-material-maker", "token")
+    monkeypatch.setattr(
+        client,
+        "_json_list_request",
+        lambda _url: [
+            _draft_release(id=397621037),
+            _draft_release(id=397619382),
+            _draft_release(id=397621224),
+            _release(id=376179211, tag_name="v0.4.0"),
+        ],
+    )
+
+    assert client.find_release_by_tag(TAG)["id"] == 397619382
+
+
+def test_find_release_by_tag_returns_none_for_an_unrelated_repository(monkeypatch) -> None:
+    client = release_guard.GitHubReleaseClient("dcc-mcp/dcc-mcp-material-maker", "token")
+    monkeypatch.setattr(client, "_json_list_request", lambda _url: [_release(tag_name="v0.4.0")])
+
+    assert client.find_release_by_tag(TAG) is None
+
+
+def test_list_releases_stops_paging_on_a_short_page(monkeypatch) -> None:
+    client = release_guard.GitHubReleaseClient("dcc-mcp/dcc-mcp-material-maker", "token")
+    urls: list[str] = []
+    monkeypatch.setattr(
+        client,
+        "_json_list_request",
+        lambda url: urls.append(url) or [_draft_release(id=1)],
+    )
+
+    assert len(client.list_releases()) == 1
+    assert urls == [
+        "https://api.github.com/repos/dcc-mcp/dcc-mcp-material-maker/releases?per_page=100&page=1"
+    ]
