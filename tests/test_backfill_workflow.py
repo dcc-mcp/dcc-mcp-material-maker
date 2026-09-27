@@ -226,3 +226,17 @@ def test_backfill_step_order_stages_then_verifies_then_publishes_last(document) 
     ]
     assert sequence("publish-github-assets")[-1] == "release_guard.py publish-assets"
     assert sequence("finalize-release")[-1] == "release_guard.py finalize"
+
+
+def test_backfill_downloads_merge_into_the_workspace_root(document) -> None:
+    # Without merge-multiple, download-artifact v4 extracts into
+    # ./<artifact-name>/, and the guard can no longer find dist/ or release/.
+    for name in ("publish-pypi", "publish-github-assets", "finalize-release"):
+        downloads = [
+            step
+            for step in _steps(document["jobs"][name])
+            if str(step.get("uses", "")).startswith("actions/download-artifact")
+        ]
+        assert len(downloads) == 1
+        assert downloads[0]["with"]["merge-multiple"] == "true"
+        assert downloads[0]["with"]["path"] == "."

@@ -13,7 +13,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 EXPECTED_WORKFLOW_SEMANTIC_SHA256 = (
-    "18ed5e4ce08b65bde5311a550ef02c36c6c4abbe32713d312a94c378d9ddada9"
+    "6e7673ecf4bca8b9ddb1aa2f48176b4ec04cf3290f416db38710655546147d50"
 )
 
 PINNED_ACTIONS = {
@@ -282,9 +282,13 @@ def assert_release_workflow_contract(document: dict[str, Any]) -> None:
             "persist-credentials": "false",
         }
         download = _single_action(job, "actions/download-artifact")
+        # Without merge-multiple, download-artifact v4 extracts into
+        # ./<artifact-name>/ instead of the workspace root, so the guard can
+        # no longer find dist/ or release/.
         assert download["with"] == {
             "artifact-ids": "${{ needs.stage-release.outputs.artifact_id }}",
             "path": ".",
+            "merge-multiple": "true",
         }
         assert _steps(job).index(_run_step(job, " verify-artifact ")) < _steps(job).index(download)
 
