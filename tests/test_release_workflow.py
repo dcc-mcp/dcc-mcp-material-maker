@@ -13,7 +13,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 EXPECTED_WORKFLOW_SEMANTIC_SHA256 = (
-    "824a396dc645223d7a308b263e64e9cf1574224327fd6cf7de12e46326ca6afd"
+    "7ffdf5bd365c986ddc340ca1f62d6fac4621cd966567e92d0782be656ec7a088"
 )
 
 PINNED_ACTIONS = {
@@ -40,6 +40,7 @@ STAGE_GATE = (
     "always() && (github.event_name == 'workflow_dispatch' "
     "|| needs.release-please.result == 'success')"
 )
+ALWAYS = "always()"
 FULL_SHA_ACTION = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$")
 MUTATING_RUN_PATTERNS = (
     re.compile(r"(^|\s)git\s+push(?:\s|$)"),
@@ -241,7 +242,7 @@ def assert_release_workflow_contract(document: dict[str, Any]) -> None:
     assert stage["outputs"]["run_id"] == "${{ github.run_id }}"
 
     allowed_job_ifs = {None, RELEASE_NEEDED, PUSH_ONLY, STAGE_GATE}
-    allowed_step_ifs = {None, DETECT_NEEDED, PUSH_ONLY, DISPATCH_ONLY, STAGE_NEEDED}
+    allowed_step_ifs = {None, DETECT_NEEDED, PUSH_ONLY, DISPATCH_ONLY, STAGE_NEEDED, ALWAYS}
     all_text: list[str] = []
     action_counts = {repository: 0 for repository in PINNED_ACTIONS}
     for job in jobs.values():
@@ -588,9 +589,12 @@ def test_dispatch_path_keeps_the_push_gate_and_publish_gate_intact() -> None:
     for name in ("publish-pypi", "publish-github-assets", "finalize-release"):
         assert jobs[name]["if"] == RELEASE_NEEDED
     assert jobs["stage-release"]["outputs"]["release_needed"] == (
-        "${{ steps.detect.outputs.release_needed == 'true'"
-        " || github.event_name == 'workflow_dispatch' }}"
+        "${{ steps.gate.outputs.release_needed }}"
     )
+    gate = _run_step(jobs["stage-release"], "release_needed=")
+    assert gate["if"] == ALWAYS
+    assert "workflow_dispatch" in gate["run"]
+    assert "steps.detect.outputs.release_needed" in gate["run"]
 
 
 def test_every_consumer_binds_the_run_head_for_the_dispatch_path() -> None:

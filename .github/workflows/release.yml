@@ -50,7 +50,7 @@ jobs:
     permissions:
       contents: write
     outputs:
-      release_needed: ${{ steps.detect.outputs.release_needed == 'true' || github.event_name == 'workflow_dispatch' }}
+      release_needed: ${{ steps.gate.outputs.release_needed }}
       tag_name: ${{ steps.stage.outputs.tag_name }}
       source_sha: ${{ steps.stage.outputs.source_sha }}
       release_id: ${{ steps.stage.outputs.release_id }}
@@ -120,6 +120,18 @@ jobs:
           --repository "${{ github.repository }}"
           --tag "$RELEASE_TAG"
           --source-sha "$RELEASE_SHA"
+      - id: gate
+        name: Resolve whether a publication is needed
+        if: always()
+        run: |
+          set -euo pipefail
+          needed=false
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            needed=true
+          elif [ "${{ steps.detect.outputs.release_needed }}" = "true" ]; then
+            needed=true
+          fi
+          printf 'release_needed=%s\n' "$needed" >> "$GITHUB_OUTPUT"
       - id: upload
         if: steps.detect.outputs.release_needed == 'true' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
