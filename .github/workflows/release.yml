@@ -49,11 +49,6 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
-    env:
-      GUARD: >-
-        ${{ github.event_name == 'workflow_dispatch'
-        && format('{0}/release-guard/release_guard.py', runner.temp)
-        || 'tools/release_guard.py' }}
     outputs:
       release_needed: ${{ steps.detect.outputs.release_needed == 'true' || github.event_name == 'workflow_dispatch' }}
       tag_name: ${{ steps.stage.outputs.tag_name }}
@@ -114,6 +109,10 @@ jobs:
         if: steps.detect.outputs.release_needed == 'true' || github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
+          GUARD: >-
+            ${{ github.event_name == 'workflow_dispatch'
+            && format('{0}/release-guard/release_guard.py', runner.temp)
+            || 'tools/release_guard.py' }}
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || steps.detect.outputs.tag_name }}
           RELEASE_SHA: ${{ steps.resolve.outputs.source_sha }}
         run: >-

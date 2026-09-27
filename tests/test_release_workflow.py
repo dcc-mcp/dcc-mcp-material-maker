@@ -13,7 +13,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 EXPECTED_WORKFLOW_SEMANTIC_SHA256 = (
-    "6c243a944296204a55713c641e936944d8bbef8a656041b5c98c343725b0a677"
+    "824a396dc645223d7a308b263e64e9cf1574224327fd6cf7de12e46326ca6afd"
 )
 
 PINNED_ACTIONS = {
@@ -170,7 +170,6 @@ def assert_release_workflow_contract(document: dict[str, Any]) -> None:
         "runs-on",
         "timeout-minutes",
         "permissions",
-        "env",
         "outputs",
         "steps",
     }
@@ -268,6 +267,11 @@ def assert_release_workflow_contract(document: dict[str, Any]) -> None:
                 if mutating_guard:
                     expected_env = {"GH_TOKEN": "${{ github.token }}"}
                     if " stage " in command:
+                        expected_env["GUARD"] = (
+                            "${{ github.event_name == 'workflow_dispatch'"
+                            " && format('{0}/release-guard/release_guard.py', runner.temp)"
+                            " || 'tools/release_guard.py' }}"
+                        )
                         expected_env["RELEASE_TAG"] = (
                             "${{ github.event_name == 'workflow_dispatch' && inputs.tag_name"
                             " || steps.detect.outputs.tag_name }}"
@@ -555,6 +559,11 @@ def test_dispatch_path_builds_from_the_tag_and_runs_the_reviewed_guard() -> None
     assert guard_checkout["with"]["path"] == ".release-guard"
 
     stage_step = _run_step(stage, " stage --repository ")
+    assert stage_step["env"]["GUARD"] == (
+        "${{ github.event_name == 'workflow_dispatch'"
+        " && format('{0}/release-guard/release_guard.py', runner.temp)"
+        " || 'tools/release_guard.py' }}"
+    )
     assert stage_step["env"]["RELEASE_TAG"] == (
         "${{ github.event_name == 'workflow_dispatch' && inputs.tag_name"
         " || steps.detect.outputs.tag_name }}"
@@ -566,11 +575,6 @@ def test_dispatch_path_builds_from_the_tag_and_runs_the_reviewed_guard() -> None
     # The guard is staged outside the tree so the sdist cannot absorb it.
     assert "mv .release-guard/tools/release_guard.py" in joined
     assert "rm -rf .release-guard" in joined
-    assert stage["env"]["GUARD"] == (
-        "${{ github.event_name == 'workflow_dispatch'"
-        " && format('{0}/release-guard/release_guard.py', runner.temp)"
-        " || 'tools/release_guard.py' }}"
-    )
 
 
 def test_dispatch_path_keeps_the_push_gate_and_publish_gate_intact() -> None:
