@@ -27,14 +27,14 @@ permissions:
 
 jobs:
   release-please:
-    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
       pull-requests: write
     steps:
-      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
+      - if: github.event_name == 'push'
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
         with:
           token: ${{ github.token }}
           config-file: release-please-config.json
@@ -42,9 +42,6 @@ jobs:
 
   stage-release:
     needs: release-please
-    if: >-
-      always() && (github.event_name == 'workflow_dispatch'
-      || needs.release-please.result == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
