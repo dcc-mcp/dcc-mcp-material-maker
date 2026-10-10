@@ -26,7 +26,7 @@ in-process plug-in, loopback bridge, arbitrary GDScript, shader, or shell input.
 **dcc-mcp-material-maker** — Material Maker adapter for typed bounded .ptex inspection,
 validation, and native export.
 
-It is one of **38 host adapters** in the DCC-MCP catalog. Every adapter speaks the same
+It is one of **47 host adapters** in the DCC-MCP catalog. Every adapter speaks the same
 MCP protocol and builds on the same core runtime contract; each one exposes the tools
 its own host needs on top of that.
 
