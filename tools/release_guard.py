@@ -49,6 +49,7 @@ RELEASE_OBSERVABILITY_ATTEMPTS = 4
 RELEASE_OBSERVABILITY_DELAY_SECONDS = 2.0
 RELEASE_LIST_PAGE_SIZE = 100
 RELEASE_LIST_MAX_PAGES = 10
+PUBLISH_ATTESTATION_SUFFIX = ".publish.attestation"
 APPROVED_REQUIRES_PYTHON = ">=3.9"
 APPROVED_REQUIRES_DIST = frozenset(
     {
@@ -968,6 +969,36 @@ def _validate_sdist_metadata(path: Path, *, project: str, version: str) -> None:
     _validate_metadata(payload, project=project, version=version)
 
 
+def _without_publish_attestations(entries: list[Path]) -> list[Path]:
+    """Drop ``<distribution>.publish.attestation`` sidecars from a dist listing.
+
+    ``pypa/gh-action-pypi-publish`` writes one attestation sidecar next to every
+    distribution it uploads when ``attestations`` is enabled, so the ``dist/``
+    directory of a publish job legitimately holds more files than the manifest
+    describes once the upload finished. The sidecars are provenance for a
+    distribution that must already be present, never distributions themselves,
+    so they are excluded from the immutable distribution set instead of failing
+    the exact-set check. A sidecar without its own distribution stays a hard
+    error, as does any other unexpected file.
+    """
+
+    distributions: list[Path] = []
+    sidecars: list[Path] = []
+    for entry in entries:
+        if entry.name.endswith(PUBLISH_ATTESTATION_SUFFIX) and len(entry.name) > len(
+            PUBLISH_ATTESTATION_SUFFIX
+        ):
+            sidecars.append(entry)
+        else:
+            distributions.append(entry)
+    if not sidecars:
+        return entries
+    present = {entry.name for entry in distributions}
+    if any(entry.name[: -len(PUBLISH_ATTESTATION_SUFFIX)] not in present for entry in sidecars):
+        raise ReleaseContractError("unexpected distribution files")
+    return distributions
+
+
 def create_manifest(dist_dir: Path, *, project: str, version: str) -> dict[str, object]:
     """Create a canonical manifest for exactly one wheel and one sdist."""
 
@@ -977,6 +1008,7 @@ def create_manifest(dist_dir: Path, *, project: str, version: str) -> dict[str, 
     entries = sorted(dist_dir.iterdir(), key=lambda item: item.name)
     if any(not entry.is_file() or _is_link_or_reparse(entry) for entry in entries):
         raise ReleaseContractError("unexpected distribution files")
+    entries = _without_publish_attestations(entries)
 
     wheels = [entry for entry in entries if entry.suffix == ".whl"]
     sdists = [entry for entry in entries if entry.name.endswith(".tar.gz")]
@@ -1055,6 +1087,7 @@ def verify_manifest(manifest_path: Path, dist_dir: Path, expected_sha256: str) -
     if not dist_dir.is_dir() or _is_link_or_reparse(dist_dir):
         raise ReleaseContractError("distribution directory is missing or unsafe")
     entries = sorted(dist_dir.iterdir(), key=lambda item: item.name)
+    entries = _without_publish_attestations(entries)
     if {entry.name for entry in entries} != set(expected_artifacts):
         raise ReleaseContractError("artifact digest mismatch")
     for entry in entries:
