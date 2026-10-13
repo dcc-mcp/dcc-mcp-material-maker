@@ -572,6 +572,61 @@ def test_manifest_rejects_missing_or_extra_distribution(tmp_path, missing_name: 
     with pytest.raises(ReleaseContractError, match="unexpected distribution files"):
         create_manifest(dist, project=PROJECT, version=VERSION)
 
+    manifest_path = tmp_path / "extra" / "manifest.json"
+    manifest_sha256 = write_manifest(_current_dist_manifest(dist), manifest_path)
+    with pytest.raises(ReleaseContractError, match="unexpected distribution files"):
+        verify_manifest(manifest_path, dist, manifest_sha256)
+
+
+PUBLISH_ATTESTATION_SIDECARS = (
+    "dcc_mcp_material_maker-0.4.1-py3-none-any.whl.publish.attestation",
+    "dcc_mcp_material_maker-0.4.1.tar.gz.publish.attestation",
+)
+
+
+@pytest.mark.parametrize("phase", ["create", "verify"])
+def test_manifest_accepts_publish_action_attestation_sidecars(tmp_path, phase: str) -> None:
+    """pypa/gh-action-pypi-publish writes one sidecar per uploaded distribution.
+
+    With ``attestations: true`` the publish step leaves ``<dist>.publish.attestation``
+    files inside ``dist/``, the same directory the guard re-checks immediately after
+    the upload. Those sidecars are provenance data, not distributions, so the
+    exact-set check ignores them instead of failing with "artifact digest mismatch"
+    the way run 38008435511 did.
+    """
+
+    dist = _dist(tmp_path)
+    expected = create_manifest(dist, project=PROJECT, version=VERSION)
+    for name in PUBLISH_ATTESTATION_SIDECARS:
+        (dist / name).write_bytes(b"{}")
+
+    if phase == "create":
+        assert create_manifest(dist, project=PROJECT, version=VERSION) == expected
+        return
+    manifest_path = tmp_path / "manifest.json"
+    manifest_sha256 = write_manifest(expected, manifest_path)
+    assert verify_manifest(manifest_path, dist, manifest_sha256) == expected
+
+
+@pytest.mark.parametrize("phase", ["create", "verify"])
+@pytest.mark.parametrize("dropped", PUBLISH_ATTESTATION_SIDECARS)
+def test_manifest_rejects_attestation_sidecar_without_its_distribution(
+    tmp_path, phase: str, dropped: str
+) -> None:
+    """A sidecar is tolerated only next to a distribution that is present."""
+
+    dist = _dist(tmp_path)
+    expected = create_manifest(dist, project=PROJECT, version=VERSION)
+    (dist / dropped[: -len(".publish.attestation")]).unlink()
+    (dist / dropped).write_bytes(b"{}")
+
+    with pytest.raises(ReleaseContractError, match="unexpected distribution files"):
+        if phase == "create":
+            create_manifest(dist, project=PROJECT, version=VERSION)
+        else:
+            manifest_path = tmp_path / "manifest.json"
+            verify_manifest(manifest_path, dist, write_manifest(expected, manifest_path))
+
 
 @pytest.mark.parametrize("kind", ["wheel", "sdist"])
 def test_manifest_rejects_filename_spoofed_distribution_metadata(tmp_path, kind: str) -> None:
